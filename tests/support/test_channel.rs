@@ -25,6 +25,8 @@ use ironclaw::error::ChannelError;
 /// A `Channel` implementation for injecting messages and capturing responses
 /// in integration tests.
 pub struct TestChannel {
+    /// Channel name returned by `Channel::name()`.
+    channel_name: String,
     /// Sender half for injecting `IncomingMessage`s into the stream.
     tx: mpsc::Sender<IncomingMessage>,
     /// Receiver half, wrapped in Option so `start()` can take it exactly once.
@@ -59,6 +61,7 @@ impl TestChannel {
         let (tx, rx) = mpsc::channel(256);
         let (ready_tx, ready_rx) = oneshot::channel();
         Self {
+            channel_name: "test".to_string(),
             tx,
             rx: Mutex::new(Some(rx)),
             responses: Arc::new(Mutex::new(Vec::new())),
@@ -70,6 +73,12 @@ impl TestChannel {
             ready_tx: Arc::new(Mutex::new(Some(ready_tx))),
             ready_rx: Arc::new(Mutex::new(Some(ready_rx))),
         }
+    }
+
+    /// Override the channel name (default: "test").
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.channel_name = name.into();
+        self
     }
 
     /// Signal the channel (and any listening agent) to shut down.
@@ -87,7 +96,7 @@ impl TestChannel {
 
     /// Inject a user message into the channel stream.
     pub async fn send_message(&self, content: &str) {
-        let msg = IncomingMessage::new("test", &self.user_id, content);
+        let msg = IncomingMessage::new(&self.channel_name, &self.user_id, content);
         self.tx.send(msg).await.expect("TestChannel tx closed");
     }
 
@@ -98,7 +107,8 @@ impl TestChannel {
 
     /// Inject a user message with a specific thread ID.
     pub async fn send_message_in_thread(&self, content: &str, thread_id: &str) {
-        let msg = IncomingMessage::new("test", &self.user_id, content).with_thread(thread_id);
+        let msg =
+            IncomingMessage::new(&self.channel_name, &self.user_id, content).with_thread(thread_id);
         self.tx.send(msg).await.expect("TestChannel tx closed");
     }
 
@@ -199,13 +209,89 @@ impl TestChannel {
 }
 
 // ---------------------------------------------------------------------------
+// TestChannelHandle -- wraps Arc<TestChannel> as Box<dyn Channel>
+// ---------------------------------------------------------------------------
+
+/// A thin wrapper around `Arc<TestChannel>` that implements `Channel`.
+///
+/// This lets us hand a `Box<dyn Channel>` to `ChannelManager::add()` while
+/// keeping an `Arc<TestChannel>` in the test rig for sending messages and
+/// reading captures. The `name_override` allows different test harnesses
+/// to present the channel under different names (e.g. "gateway" vs "test").
+pub struct TestChannelHandle {
+    inner: Arc<TestChannel>,
+    name: String,
+}
+
+impl TestChannelHandle {
+    /// Create a handle that delegates `name()` to the inner `TestChannel`.
+    pub fn new(inner: Arc<TestChannel>) -> Self {
+        Self {
+            name: inner.name().to_string(),
+            inner,
+        }
+    }
+
+    /// Create a handle with a custom channel name.
+    pub fn with_name(inner: Arc<TestChannel>, name: impl Into<String>) -> Self {
+        Self {
+            inner,
+            name: name.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Channel for TestChannelHandle {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn start(&self) -> Result<MessageStream, ChannelError> {
+        self.inner.start().await
+    }
+
+    async fn respond(
+        &self,
+        msg: &IncomingMessage,
+        response: OutgoingResponse,
+    ) -> Result<(), ChannelError> {
+        self.inner.respond(msg, response).await
+    }
+
+    async fn send_status(
+        &self,
+        status: StatusUpdate,
+        metadata: &serde_json::Value,
+    ) -> Result<(), ChannelError> {
+        self.inner.send_status(status, metadata).await
+    }
+
+    async fn broadcast(
+        &self,
+        user_id: &str,
+        response: OutgoingResponse,
+    ) -> Result<(), ChannelError> {
+        self.inner.broadcast(user_id, response).await
+    }
+
+    async fn health_check(&self) -> Result<(), ChannelError> {
+        self.inner.health_check().await
+    }
+
+    fn conversation_context(&self, metadata: &serde_json::Value) -> HashMap<String, String> {
+        self.inner.conversation_context(metadata)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Channel trait implementation
 // ---------------------------------------------------------------------------
 
 #[async_trait]
 impl Channel for TestChannel {
     fn name(&self) -> &str {
-        "test"
+        &self.channel_name
     }
 
     async fn start(&self) -> Result<MessageStream, ChannelError> {
@@ -215,7 +301,7 @@ impl Channel for TestChannel {
             .await
             .take()
             .ok_or_else(|| ChannelError::StartupFailed {
-                name: "test".to_string(),
+                name: self.channel_name.clone(),
                 reason: "start() already called".to_string(),
             })?;
 

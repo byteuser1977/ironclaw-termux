@@ -130,7 +130,7 @@ impl Tool for ToolInstallTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -150,7 +150,7 @@ impl Tool for ToolInstallTool {
 
         let result = self
             .manager
-            .install(name, url, kind_hint)
+            .install(name, url, kind_hint, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -205,7 +205,7 @@ impl Tool for ToolAuthTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -213,13 +213,13 @@ impl Tool for ToolAuthTool {
 
         let result = self
             .manager
-            .auth(name, None)
+            .auth(name, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         // Auto-activate after successful auth so tools are available immediately
         if result.is_authenticated() {
-            match self.manager.activate(name).await {
+            match self.manager.activate(name, &ctx.user_id).await {
                 Ok(activate_result) => {
                     let output = serde_json::json!({
                         "status": "authenticated_and_activated",
@@ -256,7 +256,13 @@ impl Tool for ToolAuthTool {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
+        // In gateway mode, tool_auth only returns an auth URL for the frontend
+        // to open — no browser is launched server-side, so no approval needed.
+        if self.manager.should_use_gateway_mode() {
+            ApprovalRequirement::Never
+        } else {
+            ApprovalRequirement::UnlessAutoApproved
+        }
     }
 }
 
@@ -298,13 +304,13 @@ impl Tool for ToolActivateTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
         let name = require_str(&params, "name")?;
 
-        match self.manager.activate(name).await {
+        match self.manager.activate(name, &ctx.user_id).await {
             Ok(result) => {
                 let output = serde_json::to_value(&result)
                     .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
@@ -323,12 +329,12 @@ impl Tool for ToolActivateTool {
 
                 // Activation failed due to missing auth; initiate auth flow
                 // so the agent loop can show the auth card.
-                match self.manager.auth(name, None).await {
+                match self.manager.auth(name, &ctx.user_id).await {
                     Ok(auth_result) if auth_result.is_authenticated() => {
                         // Auth succeeded (e.g. env var was set); retry activation.
                         let result = self
                             .manager
-                            .activate(name)
+                            .activate(name, &ctx.user_id)
                             .await
                             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
                         let output = serde_json::to_value(&result).unwrap_or_else(
@@ -398,7 +404,7 @@ impl Tool for ToolListTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -419,7 +425,7 @@ impl Tool for ToolListTool {
 
         let extensions = self
             .manager
-            .list(kind_filter, include_available)
+            .list(kind_filter, include_available, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -471,7 +477,7 @@ impl Tool for ToolRemoveTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -479,7 +485,7 @@ impl Tool for ToolRemoveTool {
 
         let message = self
             .manager
-            .remove(name)
+            .remove(name, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -535,7 +541,7 @@ impl Tool for ToolUpgradeTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -543,7 +549,7 @@ impl Tool for ToolUpgradeTool {
 
         let result = self
             .manager
-            .upgrade(name)
+            .upgrade(name, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -597,7 +603,7 @@ impl Tool for ExtensionInfoTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -605,7 +611,7 @@ impl Tool for ExtensionInfoTool {
 
         let info = self
             .manager
-            .extension_info(name)
+            .extension_info(name, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -733,6 +739,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tool_auth_no_approval_in_gateway_mode() {
+        let manager = test_manager_stub();
+        manager
+            .enable_gateway_mode("http://localhost:3000".to_string())
+            .await;
+        let tool = ToolAuthTool {
+            manager: manager.clone(),
+        };
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Never,
+            "tool_auth should not require approval in gateway mode"
+        );
+    }
+
     #[test]
     fn test_tool_upgrade_schema() {
         use crate::tools::tool::ApprovalRequirement;
@@ -768,15 +790,16 @@ mod tests {
     /// Create a stub manager for schema tests (these don't call execute).
     fn test_manager_stub() -> Arc<ExtensionManager> {
         use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::testing::credentials::TEST_CRYPTO_KEY;
         use crate::tools::ToolRegistry;
         use crate::tools::mcp::session::McpSessionManager;
 
-        let master_key =
-            secrecy::SecretString::from("0123456789abcdef0123456789abcdef".to_string());
+        let master_key = secrecy::SecretString::from(TEST_CRYPTO_KEY.to_string());
         let crypto = Arc::new(SecretsCrypto::new(master_key).unwrap());
 
         Arc::new(ExtensionManager::new(
             Arc::new(McpSessionManager::new()),
+            Arc::new(crate::tools::mcp::process::McpProcessManager::new()),
             Arc::new(InMemorySecretsStore::new(crypto)),
             Arc::new(ToolRegistry::new()),
             None,

@@ -124,7 +124,9 @@ impl WasmToolLoader {
         let wasm_bytes = fs::read(wasm_path).await?;
 
         // Read capabilities (optional) and extract OAuth refresh config
-        let (capabilities, oauth_refresh) = if let Some(cap_path) = capabilities_path {
+        // and tool description. Parameter schema is auto-derived from the
+        // WASM module's schema() export (see WasmToolSchemas::compact_schema).
+        let (capabilities, oauth_refresh, description) = if let Some(cap_path) = capabilities_path {
             if cap_path.exists() {
                 let cap_bytes = fs::read(cap_path).await?;
                 let cap_file = CapabilitiesFile::from_bytes(&cap_bytes)
@@ -140,16 +142,31 @@ impl WasmToolLoader {
 
                 let caps = cap_file.to_capabilities();
                 let oauth = resolve_oauth_refresh_config(&cap_file);
-                (caps, oauth)
+                let desc = cap_file.description.clone();
+                if desc.is_none() {
+                    tracing::warn!(
+                        tool = name,
+                        path = %cap_path.display(),
+                        "Capabilities file missing \"description\" field; \
+                         tool will use generic fallback description"
+                    );
+                }
+                (caps, oauth, desc)
             } else {
                 tracing::warn!(
+                    tool = name,
                     path = %cap_path.display(),
                     "Capabilities file not found, using default (no permissions)"
                 );
-                (Capabilities::default(), None)
+                (Capabilities::default(), None, None)
             }
         } else {
-            (Capabilities::default(), None)
+            tracing::warn!(
+                tool = name,
+                "No capabilities file for WASM tool; \
+                     tool will use generic fallback description"
+            );
+            (Capabilities::default(), None, None)
         };
 
         // Register the tool
@@ -160,14 +177,14 @@ impl WasmToolLoader {
                 runtime: &self.runtime,
                 capabilities,
                 limits: None,
-                description: None,
+                description: description.as_deref(),
                 schema: None,
                 secrets_store: self.secrets_store.clone(),
                 oauth_refresh,
             })
             .await?;
 
-        tracing::info!(
+        tracing::debug!(
             name = name,
             wasm_path = %wasm_path.display(),
             "Loaded WASM tool from file"
@@ -193,18 +210,31 @@ impl WasmToolLoader {
     ///
     /// Tools without a capabilities file get no permissions (default deny).
     pub async fn load_from_dir(&self, dir: &Path) -> Result<LoadResults, WasmLoadError> {
-        if !dir.is_dir() {
-            return Err(WasmLoadError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                format!("{} is not a directory", dir.display()),
-            )));
+        match fs::metadata(dir).await {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(WasmLoadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("{} is not a directory", dir.display()),
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LoadResults::default());
+            }
+            Err(e) => return Err(WasmLoadError::Io(e)),
         }
 
-        let mut results = LoadResults::default();
+        // Handle TOCTOU: if read_dir fails with NotFound, treat as empty
+        let mut entries = match fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LoadResults::default());
+            }
+            Err(e) => return Err(WasmLoadError::Io(e)),
+        };
 
-        // Collect all .wasm entries first, then load in parallel
+        let mut results = LoadResults::default();
         let mut tool_entries = Vec::new();
-        let mut entries = fs::read_dir(dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -254,7 +284,7 @@ impl WasmToolLoader {
         }
 
         if !results.loaded.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 count = results.loaded.len(),
                 tools = ?results.loaded,
                 "Loaded WASM tools from directory"
@@ -388,6 +418,7 @@ fn resolve_oauth_refresh_config(cap_file: &CapabilitiesFile) -> Option<OAuthRefr
     let oauth = auth.oauth.as_ref()?;
 
     let builtin = crate::cli::oauth_defaults::builtin_credentials(&auth.secret_name);
+    let exchange_proxy_url = crate::cli::oauth_defaults::exchange_proxy_url();
 
     let client_id = oauth
         .client_id
@@ -410,11 +441,19 @@ fn resolve_oauth_refresh_config(cap_file: &CapabilitiesFile) -> Option<OAuthRefr
                 .and_then(|env| std::env::var(env).ok())
         })
         .or_else(|| builtin.as_ref().map(|c| c.client_secret.to_string()));
+    let client_secret = crate::cli::oauth_defaults::hosted_proxy_client_secret(
+        &client_secret,
+        builtin.as_ref(),
+        exchange_proxy_url.is_some(),
+    );
+    let oauth_proxy_auth_token = crate::cli::oauth_defaults::oauth_proxy_auth_token();
 
     Some(OAuthRefreshConfig {
         token_url: oauth.token_url.clone(),
         client_id,
         client_secret,
+        exchange_proxy_url,
+        gateway_token: oauth_proxy_auth_token,
         secret_name: auth.secret_name.clone(),
         provider: auth.provider.clone(),
     })
@@ -681,7 +720,43 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::config::helpers::lock_env;
+    use crate::testing::credentials::{TEST_OAUTH_CLIENT_ID, TEST_OAUTH_CLIENT_SECRET};
     use crate::tools::wasm::loader::{WasmLoadError, check_wit_version_compat, discover_tools};
+
+    /// Restores a test-scoped env var override on drop.
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: Tests use lock_env() to serialize environment access.
+            unsafe {
+                if let Some(ref value) = self.previous {
+                    std::env::set_var(&self.key, value);
+                } else {
+                    std::env::remove_var(&self.key);
+                }
+            }
+        }
+    }
+
+    fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
+        let previous = std::env::var(key).ok();
+        // SAFETY: Tests use lock_env() to serialize environment access.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        EnvVarGuard {
+            key: key.to_string(),
+            previous,
+        }
+    }
 
     #[test]
     fn wit_version_compat_none_is_ok() {
@@ -814,6 +889,11 @@ mod tests {
             AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
         };
 
+        let _guard = lock_env();
+        let _proxy_guard = set_env_var("IRONCLAW_OAUTH_EXCHANGE_URL", None);
+        let _gateway_token_guard = set_env_var("GATEWAY_AUTH_TOKEN", None);
+        let _oauth_proxy_token_guard = set_env_var("IRONCLAW_OAUTH_PROXY_AUTH_TOKEN", None);
+
         let caps = CapabilitiesFile {
             auth: Some(AuthCapabilitySchema {
                 secret_name: "google_oauth_token".to_string(),
@@ -821,8 +901,8 @@ mod tests {
                 oauth: Some(OAuthConfigSchema {
                     authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
                     token_url: "https://oauth2.googleapis.com/token".to_string(),
-                    client_id: Some("test-client-id".to_string()),
-                    client_secret: Some("test-client-secret".to_string()),
+                    client_id: Some(TEST_OAUTH_CLIENT_ID.to_string()),
+                    client_secret: Some(TEST_OAUTH_CLIENT_SECRET.to_string()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -835,8 +915,13 @@ mod tests {
 
         let config = config.unwrap();
         assert_eq!(config.token_url, "https://oauth2.googleapis.com/token");
-        assert_eq!(config.client_id, "test-client-id");
-        assert_eq!(config.client_secret, Some("test-client-secret".to_string()));
+        assert_eq!(config.client_id, TEST_OAUTH_CLIENT_ID);
+        assert_eq!(
+            config.client_secret,
+            Some(TEST_OAUTH_CLIENT_SECRET.to_string())
+        );
+        assert_eq!(config.exchange_proxy_url, None);
+        assert_eq!(config.gateway_token, None);
         assert_eq!(config.secret_name, "google_oauth_token");
         assert_eq!(config.provider, Some("google".to_string()));
     }
@@ -897,6 +982,11 @@ mod tests {
             AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
         };
 
+        let _guard = lock_env();
+        let _proxy_guard = set_env_var("IRONCLAW_OAUTH_EXCHANGE_URL", None);
+        let _gateway_token_guard = set_env_var("GATEWAY_AUTH_TOKEN", None);
+        let _oauth_proxy_token_guard = set_env_var("IRONCLAW_OAUTH_PROXY_AUTH_TOKEN", None);
+
         // google_oauth_token should fall back to built-in credentials
         let caps = CapabilitiesFile {
             auth: Some(AuthCapabilitySchema {
@@ -918,6 +1008,138 @@ mod tests {
         let config = config.unwrap();
         assert!(!config.client_id.is_empty());
         assert!(config.client_secret.is_some());
+        assert_eq!(config.exchange_proxy_url, None);
+        assert_eq!(config.gateway_token, None);
+    }
+
+    #[test]
+    fn test_resolve_oauth_refresh_config_hosted_proxy_populates_env_and_suppresses_builtin_secret()
+    {
+        use crate::tools::wasm::capabilities_schema::{
+            AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
+        };
+
+        let _guard = lock_env();
+        let _proxy_guard = set_env_var(
+            "IRONCLAW_OAUTH_EXCHANGE_URL",
+            Some("https://compose-api.example.com"),
+        );
+        let _gateway_token_guard = set_env_var("GATEWAY_AUTH_TOKEN", Some("gateway-test-token"));
+        let _oauth_proxy_token_guard = set_env_var("IRONCLAW_OAUTH_PROXY_AUTH_TOKEN", None);
+        let _client_id_guard =
+            set_env_var("GOOGLE_OAUTH_CLIENT_ID", Some("hosted-google-client-id"));
+
+        let caps = CapabilitiesFile {
+            auth: Some(AuthCapabilitySchema {
+                secret_name: "google_oauth_token".to_string(),
+                provider: Some("google".to_string()),
+                oauth: Some(OAuthConfigSchema {
+                    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+                    token_url: "https://oauth2.googleapis.com/token".to_string(),
+                    client_id_env: Some("GOOGLE_OAUTH_CLIENT_ID".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = super::resolve_oauth_refresh_config(&caps).expect("hosted oauth config");
+        assert_eq!(config.client_id, "hosted-google-client-id");
+        assert_eq!(config.client_secret, None);
+        assert_eq!(
+            config.exchange_proxy_url.as_deref(),
+            Some("https://compose-api.example.com")
+        );
+        assert_eq!(config.gateway_token.as_deref(), Some("gateway-test-token"));
+    }
+
+    #[test]
+    fn test_resolve_oauth_refresh_config_hosted_proxy_preserves_explicit_secret() {
+        use crate::tools::wasm::capabilities_schema::{
+            AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
+        };
+
+        let _guard = lock_env();
+        let _proxy_guard = set_env_var(
+            "IRONCLAW_OAUTH_EXCHANGE_URL",
+            Some("https://compose-api.example.com"),
+        );
+        let _gateway_token_guard = set_env_var("GATEWAY_AUTH_TOKEN", Some("gateway-test-token"));
+        let _oauth_proxy_token_guard = set_env_var("IRONCLAW_OAUTH_PROXY_AUTH_TOKEN", None);
+        let _client_id_guard =
+            set_env_var("GOOGLE_OAUTH_CLIENT_ID", Some("hosted-google-client-id"));
+        let _client_secret_guard =
+            set_env_var("GOOGLE_OAUTH_CLIENT_SECRET", Some("hosted-server-secret"));
+
+        let caps = CapabilitiesFile {
+            auth: Some(AuthCapabilitySchema {
+                secret_name: "google_oauth_token".to_string(),
+                provider: Some("google".to_string()),
+                oauth: Some(OAuthConfigSchema {
+                    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+                    token_url: "https://oauth2.googleapis.com/token".to_string(),
+                    client_id_env: Some("GOOGLE_OAUTH_CLIENT_ID".to_string()),
+                    client_secret_env: Some("GOOGLE_OAUTH_CLIENT_SECRET".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = super::resolve_oauth_refresh_config(&caps).expect("hosted oauth config");
+        assert_eq!(config.client_id, "hosted-google-client-id");
+        assert_eq!(
+            config.client_secret.as_deref(),
+            Some("hosted-server-secret")
+        );
+        assert_eq!(
+            config.exchange_proxy_url.as_deref(),
+            Some("https://compose-api.example.com")
+        );
+        assert_eq!(config.gateway_token.as_deref(), Some("gateway-test-token"));
+    }
+
+    #[test]
+    fn test_resolve_oauth_refresh_config_hosted_proxy_prefers_dedicated_proxy_auth_token() {
+        use crate::tools::wasm::capabilities_schema::{
+            AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema,
+        };
+
+        let _guard = lock_env();
+        let _proxy_guard = set_env_var(
+            "IRONCLAW_OAUTH_EXCHANGE_URL",
+            Some("https://compose-api.example.com"),
+        );
+        let _gateway_token_guard = set_env_var("GATEWAY_AUTH_TOKEN", Some("gateway-test-token"));
+        let _oauth_proxy_token_guard = set_env_var(
+            "IRONCLAW_OAUTH_PROXY_AUTH_TOKEN",
+            Some("shared-oauth-proxy-secret"),
+        );
+        let _client_id_guard =
+            set_env_var("GOOGLE_OAUTH_CLIENT_ID", Some("hosted-google-client-id"));
+
+        let caps = CapabilitiesFile {
+            auth: Some(AuthCapabilitySchema {
+                secret_name: "google_oauth_token".to_string(),
+                provider: Some("google".to_string()),
+                oauth: Some(OAuthConfigSchema {
+                    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+                    token_url: "https://oauth2.googleapis.com/token".to_string(),
+                    client_id_env: Some("GOOGLE_OAUTH_CLIENT_ID".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = super::resolve_oauth_refresh_config(&caps).expect("hosted oauth config");
+        assert_eq!(
+            config.gateway_token.as_deref(),
+            Some("shared-oauth-proxy-secret")
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1076,5 +1298,20 @@ mod tests {
             !tools.contains_key("nested"),
             "nested.wasm inside subdir should NOT be discovered"
         );
+    }
+
+    #[tokio::test]
+    async fn load_from_dir_returns_empty_when_dir_missing() {
+        let loader = make_loader();
+
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent_tools_dir");
+
+        let results = loader.load_from_dir(&missing).await;
+
+        // Must succeed with empty results, not error
+        let results = results.expect("missing dir should return Ok, not Err");
+        assert!(results.loaded.is_empty());
+        assert!(results.errors.is_empty());
     }
 }

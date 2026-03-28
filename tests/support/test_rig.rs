@@ -6,94 +6,24 @@
 
 #![allow(dead_code)] // Public API consumed by later test modules (Task 4+).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use async_trait::async_trait;
 
 use ironclaw::agent::{Agent, AgentDeps};
 use ironclaw::app::{AppBuilder, AppBuilderFlags};
 use ironclaw::channels::web::log_layer::LogBroadcaster;
-use ironclaw::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
+use ironclaw::channels::{OutgoingResponse, StatusUpdate};
 use ironclaw::config::Config;
 use ironclaw::db::Database;
-use ironclaw::error::ChannelError;
 use ironclaw::llm::{LlmProvider, SessionConfig, SessionManager};
 use ironclaw::tools::Tool;
 
 use crate::support::instrumented_llm::InstrumentedLlm;
 use crate::support::metrics::{ToolInvocation, TraceMetrics};
-use crate::support::test_channel::TestChannel;
+use crate::support::test_channel::{TestChannel, TestChannelHandle};
 use crate::support::trace_llm::{LlmTrace, TraceLlm};
 
-use ironclaw::llm::recording::{HttpExchange, ReplayingHttpInterceptor};
-
-// ---------------------------------------------------------------------------
-// TestChannelHandle -- wraps Arc<TestChannel> as Box<dyn Channel>
-// ---------------------------------------------------------------------------
-
-/// A thin wrapper around `Arc<TestChannel>` that implements `Channel`.
-///
-/// This lets us hand a `Box<dyn Channel>` to `ChannelManager::add()` while
-/// keeping an `Arc<TestChannel>` in the `TestRig` for sending messages and
-/// reading captures.
-struct TestChannelHandle {
-    inner: Arc<TestChannel>,
-}
-
-impl TestChannelHandle {
-    fn new(inner: Arc<TestChannel>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait]
-impl Channel for TestChannelHandle {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    async fn start(&self) -> Result<MessageStream, ChannelError> {
-        self.inner.start().await
-    }
-
-    async fn respond(
-        &self,
-        msg: &IncomingMessage,
-        response: OutgoingResponse,
-    ) -> Result<(), ChannelError> {
-        self.inner.respond(msg, response).await
-    }
-
-    async fn send_status(
-        &self,
-        status: StatusUpdate,
-        metadata: &serde_json::Value,
-    ) -> Result<(), ChannelError> {
-        self.inner.send_status(status, metadata).await
-    }
-
-    async fn broadcast(
-        &self,
-        user_id: &str,
-        response: OutgoingResponse,
-    ) -> Result<(), ChannelError> {
-        self.inner.broadcast(user_id, response).await
-    }
-
-    async fn health_check(&self) -> Result<(), ChannelError> {
-        self.inner.health_check().await
-    }
-
-    fn conversation_context(&self, metadata: &serde_json::Value) -> HashMap<String, String> {
-        self.inner.conversation_context(metadata)
-    }
-
-    async fn shutdown(&self) -> Result<(), ChannelError> {
-        self.inner.shutdown().await
-    }
-}
+use ironclaw::llm::recording::{HttpExchange, HttpInterceptor, ReplayingHttpInterceptor};
 
 // ---------------------------------------------------------------------------
 // TestRig
@@ -120,6 +50,12 @@ pub struct TestRig {
     /// The underlying TraceLlm for inspecting captured requests.
     #[cfg(feature = "libsql")]
     trace_llm: Option<Arc<TraceLlm>>,
+    /// Extension manager for direct extension operations in tests.
+    #[cfg(feature = "libsql")]
+    extension_manager: Option<Arc<ironclaw::extensions::ExtensionManager>>,
+    /// Session manager for direct session/thread access in tests.
+    #[cfg(feature = "libsql")]
+    session_manager: Arc<ironclaw::agent::SessionManager>,
     /// Temp directory guard -- keeps the libSQL database file alive.
     #[cfg(feature = "libsql")]
     _temp_dir: tempfile::TempDir,
@@ -144,6 +80,17 @@ impl TestRig {
             .as_ref()
             .map(|t| t.captured_requests())
             .unwrap_or_default()
+    }
+
+    /// Return the extension manager for direct extension operations in tests.
+    pub fn extension_manager(&self) -> Option<&Arc<ironclaw::extensions::ExtensionManager>> {
+        self.extension_manager.as_ref()
+    }
+
+    /// Return the session manager for direct session/thread access in tests.
+    #[cfg(feature = "libsql")]
+    pub fn session_manager(&self) -> &Arc<ironclaw::agent::SessionManager> {
+        &self.session_manager
     }
 
     /// Wait until at least `n` responses have been captured, or `timeout` elapses.
@@ -312,7 +259,23 @@ impl TestRig {
                 .collect();
             let started = self.tool_calls_started();
             let completed = self.tool_calls_completed();
-            let results = self.tool_results();
+            let mut results = self.tool_results();
+            for status in self.channel.captured_status_events() {
+                if let ironclaw::channels::StatusUpdate::ToolCompleted {
+                    name,
+                    success: false,
+                    error,
+                    parameters,
+                } = status
+                {
+                    let detail = format!(
+                        "error={}; params={}",
+                        error.unwrap_or_else(|| "unknown".to_string()),
+                        parameters.unwrap_or_else(|| "{}".to_string())
+                    );
+                    results.push((name, detail));
+                }
+            }
             verify_expects(
                 &trace.expects,
                 &all_response_strings,
@@ -339,7 +302,23 @@ impl TestRig {
         let response_strings: Vec<String> = responses.iter().map(|r| r.content.clone()).collect();
         let started = self.tool_calls_started();
         let completed = self.tool_calls_completed();
-        let results = self.tool_results();
+        let mut results = self.tool_results();
+        for status in self.channel.captured_status_events() {
+            if let ironclaw::channels::StatusUpdate::ToolCompleted {
+                name,
+                success: false,
+                error,
+                parameters,
+            } = status
+            {
+                let detail = format!(
+                    "error={}; params={}",
+                    error.unwrap_or_else(|| "unknown".to_string()),
+                    parameters.unwrap_or_else(|| "{}".to_string())
+                );
+                results.push((name, detail));
+            }
+        }
         verify_expects(
             &trace.expects,
             &response_strings,
@@ -373,15 +352,26 @@ impl Drop for TestRig {
 // TestRigBuilder
 // ---------------------------------------------------------------------------
 
+/// Specification for loading a real WASM tool in the test rig.
+pub struct WasmToolSpec {
+    pub name: String,
+    pub wasm_path: std::path::PathBuf,
+    pub capabilities_path: Option<std::path::PathBuf>,
+}
+
 /// Builder for constructing a `TestRig`.
 pub struct TestRigBuilder {
     trace: Option<LlmTrace>,
     llm: Option<Arc<dyn LlmProvider>>,
     max_tool_iterations: usize,
     injection_check: bool,
+    auto_approve_tools: Option<bool>,
+    enable_skills: bool,
     enable_routines: bool,
     http_exchanges: Vec<HttpExchange>,
     extra_tools: Vec<Arc<dyn Tool>>,
+    wasm_tools: Vec<WasmToolSpec>,
+    keep_bootstrap: bool,
 }
 
 impl TestRigBuilder {
@@ -392,10 +382,37 @@ impl TestRigBuilder {
             llm: None,
             max_tool_iterations: 10,
             injection_check: false,
+            auto_approve_tools: Some(true),
+            enable_skills: false,
             enable_routines: false,
             http_exchanges: Vec::new(),
             extra_tools: Vec::new(),
+            wasm_tools: Vec::new(),
+            keep_bootstrap: false,
         }
+    }
+
+    /// Load a real WASM tool binary into the test rig.
+    ///
+    /// The tool will be compiled, registered, and wired with the same HTTP
+    /// interceptor used for `with_http_exchanges()`, so `http_exchanges` in
+    /// the trace can specify expected requests/responses for WASM tool HTTP calls.
+    ///
+    /// If the WASM binary does not exist at build time, the tool is silently
+    /// skipped (logged as a warning). Tests should use `#[ignore]` or check
+    /// for the binary in a preamble if the tool is required.
+    pub fn with_wasm_tool(
+        mut self,
+        name: impl Into<String>,
+        wasm_path: impl Into<std::path::PathBuf>,
+        capabilities_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        self.wasm_tools.push(WasmToolSpec {
+            name: name.into(),
+            wasm_path: wasm_path.into(),
+            capabilities_path,
+        });
+        self
     }
 
     /// Set the LLM trace to replay.
@@ -432,11 +449,29 @@ impl TestRigBuilder {
         self
     }
 
+    /// Override agent-level automatic approval of `UnlessAutoApproved` tools.
+    pub fn with_auto_approve_tools(mut self, enable: bool) -> Self {
+        self.auto_approve_tools = Some(enable);
+        self
+    }
+
+    /// Enable skill discovery and registration for this test rig.
+    pub fn with_skills(mut self) -> Self {
+        self.enable_skills = true;
+        self
+    }
+
     /// Enable the routines system so the scheduler is wired with a `RoutineEngine`,
     /// allowing routine jobs to actually execute. Routine tools are always registered
     /// but require the engine to dispatch jobs.
     pub fn with_routines(mut self) -> Self {
         self.enable_routines = true;
+        self
+    }
+
+    /// Keep `bootstrap_pending` so the proactive greeting fires on startup.
+    pub fn with_bootstrap(mut self) -> Self {
+        self.keep_bootstrap = true;
         self
     }
 
@@ -466,9 +501,13 @@ impl TestRigBuilder {
             llm,
             max_tool_iterations,
             injection_check,
+            auto_approve_tools,
+            enable_skills,
             enable_routines,
             http_exchanges: explicit_http_exchanges,
             extra_tools,
+            wasm_tools,
+            keep_bootstrap,
         } = self;
 
         // 1. Create temp dir + libSQL database + run migrations.
@@ -491,6 +530,10 @@ impl TestRigBuilder {
         let mut config = Config::for_testing(db_path, skills_dir, installed_skills_dir);
         config.agent.max_tool_iterations = max_tool_iterations;
         config.safety.injection_check_enabled = injection_check;
+        config.skills.enabled = enable_skills;
+        if let Some(v) = auto_approve_tools {
+            config.agent.auto_approve_tools = v;
+        }
 
         // 3. Create SessionManager + LogBroadcaster.
         let session = Arc::new(SessionManager::new(SessionConfig::default()));
@@ -540,16 +583,45 @@ impl TestRigBuilder {
         );
         builder.with_database(Arc::clone(&db));
         builder.with_llm(llm);
-        let components = builder
+        let mut components = builder
             .build_all()
             .await
             .expect("AppBuilder::build_all() failed in test rig");
 
+        // Clear bootstrap flag so tests don't get an unexpected proactive greeting
+        // (unless the test explicitly wants to test the bootstrap flow).
+        if !keep_bootstrap && let Some(ref ws) = components.workspace {
+            ws.take_bootstrap_pending();
+        }
+
+        // AppBuilder may re-resolve config from env/TOML and override test defaults.
+        // Force test-rig agent flags to the requested deterministic values.
+        components.config.agent.auto_approve_tools = auto_approve_tools.unwrap_or(true);
+        components.config.agent.allow_local_tools = true;
+
         let scheduler_slot: ironclaw::tools::builtin::SchedulerSlot =
             Arc::new(tokio::sync::RwLock::new(None));
 
+        // Build HTTP interceptor once — shared by both AgentDeps and WASM tools.
+        let http_interceptor: Option<Arc<dyn HttpInterceptor>> = {
+            let exchanges = if explicit_http_exchanges.is_empty() {
+                trace_http_exchanges
+            } else {
+                explicit_http_exchanges
+            };
+            if exchanges.is_empty() {
+                None
+            } else {
+                Some(Arc::new(ReplayingHttpInterceptor::new(exchanges)) as Arc<dyn HttpInterceptor>)
+            }
+        };
+
         // 6. Register job tools, routine tools, and extra tools.
         {
+            // Ensure filesystem/shell dev tools are always available in the
+            // test rig, even if upstream builder flags/config disable local tools.
+            components.tools.register_dev_tools();
+
             components.tools.register_job_tools(
                 Arc::clone(&components.context_manager),
                 Some(scheduler_slot.clone()),
@@ -570,29 +642,107 @@ impl TestRigBuilder {
                 let (notify_tx, _notify_rx) = tokio::sync::mpsc::channel(16);
                 let engine = Arc::new(RoutineEngine::new(
                     routine_config,
-                    Arc::clone(db_arc),
+                    ironclaw::tenant::AdminScope::new(Arc::clone(db_arc)),
                     components.llm.clone(),
                     Arc::clone(ws),
                     notify_tx,
                     None,
+                    None,
+                    components.tools.clone(),
+                    components.safety.clone(),
+                    ironclaw::agent::SandboxReadiness::Available, // tests don't use real Docker
                 ));
                 components
                     .tools
                     .register_routine_tools(Arc::clone(db_arc), engine);
             }
 
+            // Skills tools: ensure tests use temp skill dirs (sandbox-safe) even if
+            // AppBuilder did not wire them for this environment.
+            if enable_skills {
+                let registry = Arc::new(std::sync::RwLock::new(
+                    ironclaw::skills::SkillRegistry::new(temp_dir.path().join("skills"))
+                        .with_installed_dir(temp_dir.path().join("installed_skills")),
+                ));
+                let catalog = ironclaw::skills::catalog::shared_catalog();
+                components
+                    .tools
+                    .register_skill_tools(Arc::clone(&registry), Arc::clone(&catalog));
+                components.skill_registry = Some(registry);
+                components.skill_catalog = Some(catalog);
+            }
+
             // Register any extra test-specific tools.
             for tool in extra_tools {
                 components.tools.register(tool).await;
+            }
+
+            // Register WASM tools with the shared HTTP interceptor.
+            if !wasm_tools.is_empty() {
+                use ironclaw::tools::wasm::{
+                    Capabilities, CapabilitiesFile, WasmRuntimeConfig, WasmToolRuntime,
+                    WasmToolWrapper,
+                };
+
+                let runtime = Arc::new(
+                    WasmToolRuntime::new(WasmRuntimeConfig::default())
+                        .expect("create WASM runtime for test rig"),
+                );
+
+                for spec in wasm_tools {
+                    if !spec.wasm_path.exists() {
+                        tracing::warn!(
+                            name = %spec.name,
+                            path = %spec.wasm_path.display(),
+                            "WASM tool binary not found, skipping"
+                        );
+                        continue;
+                    }
+                    let wasm_bytes = tokio::fs::read(&spec.wasm_path)
+                        .await
+                        .unwrap_or_else(|e| panic!("read {}: {e}", spec.wasm_path.display()));
+                    let (capabilities, description) =
+                        if let Some(cap_path) = &spec.capabilities_path {
+                            if cap_path.exists() {
+                                let cap_bytes = tokio::fs::read(cap_path)
+                                    .await
+                                    .unwrap_or_else(|e| panic!("read {}: {e}", cap_path.display()));
+                                let cap_file = CapabilitiesFile::from_bytes(&cap_bytes)
+                                    .expect("parse capabilities.json");
+                                (cap_file.to_capabilities(), cap_file.description.clone())
+                            } else {
+                                (Capabilities::default(), None)
+                            }
+                        } else {
+                            (Capabilities::default(), None)
+                        };
+
+                    let prepared = runtime
+                        .prepare(&spec.name, &wasm_bytes, None)
+                        .await
+                        .unwrap_or_else(|e| panic!("prepare WASM tool '{}': {e}", spec.name));
+                    let mut wrapper =
+                        WasmToolWrapper::new(Arc::clone(&runtime), prepared, capabilities);
+                    if let Some(desc) = description {
+                        wrapper = wrapper.with_description(desc);
+                    }
+                    if let Some(interceptor) = &http_interceptor {
+                        wrapper = wrapper.with_http_interceptor(Arc::clone(interceptor));
+                    }
+                    components.tools.register(Arc::new(wrapper)).await;
+                }
             }
         }
 
         // Save references for test accessors.
         let db_ref = components.db.clone().expect("test rig requires a database");
         let workspace_ref = components.workspace.clone();
+        let ext_mgr_ref = components.extension_manager.clone();
+        let session_manager_ref = Arc::new(ironclaw::agent::SessionManager::new());
 
         // 7. Construct AgentDeps from AppComponents (mirrors main.rs).
         let deps = AgentDeps {
+            owner_id: components.config.owner_id.clone(),
             store: components.db,
             llm: components.llm,
             cheap_llm: components.cheap_llm,
@@ -606,26 +756,23 @@ impl TestRigBuilder {
             hooks: components.hooks,
             cost_guard: components.cost_guard,
             sse_tx: None,
-            http_interceptor: {
-                // Prefer explicit exchanges from with_http_exchanges(), fall back to trace.
-                let exchanges = if explicit_http_exchanges.is_empty() {
-                    trace_http_exchanges
-                } else {
-                    explicit_http_exchanges
-                };
-                if exchanges.is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(ReplayingHttpInterceptor::new(exchanges))
-                        as Arc<dyn ironclaw::llm::recording::HttpInterceptor>)
-                }
-            },
+            http_interceptor,
             transcription: None,
             document_extraction: None,
+            sandbox_readiness: ironclaw::agent::SandboxReadiness::Available, // tests don't use real Docker
+            builder: None,
+            llm_backend: "nearai".to_string(),
+            tenant_rates: std::sync::Arc::new(ironclaw::tenant::TenantRateRegistry::new(4, 3)),
         };
 
         // 7. Create TestChannel and ChannelManager.
-        let test_channel = Arc::new(TestChannel::new());
+        // When testing bootstrap, the channel must be named "gateway" because
+        // the bootstrap greeting targets only the gateway channel.
+        let test_channel = if self.keep_bootstrap {
+            Arc::new(TestChannel::new().with_name("gateway"))
+        } else {
+            Arc::new(TestChannel::new())
+        };
         let handle = TestChannelHandle::new(Arc::clone(&test_channel));
         let channel_manager = ChannelManager::new();
         channel_manager.add(Box::new(handle)).await;
@@ -633,7 +780,7 @@ impl TestRigBuilder {
 
         // 7b. Register message tool so routines can send messages to channels.
         deps.tools
-            .register_message_tools(Arc::clone(&channels))
+            .register_message_tools(Arc::clone(&channels), deps.extension_manager.clone())
             .await;
 
         // 8. Create Agent.
@@ -644,6 +791,8 @@ impl TestRigBuilder {
                 max_concurrent_routines: 3,
                 default_cooldown_secs: 300,
                 max_lightweight_tokens: 4096,
+                lightweight_tools_enabled: true,
+                lightweight_max_iterations: 3,
             })
         } else {
             None
@@ -656,7 +805,7 @@ impl TestRigBuilder {
             None, // hygiene_config
             routine_config,
             Some(Arc::clone(&components.context_manager)),
-            None, // session_manager
+            Some(Arc::clone(&session_manager_ref)),
         );
 
         // Match main.rs: fill the scheduler slot once Agent::new has created it.
@@ -683,6 +832,8 @@ impl TestRigBuilder {
             db: db_ref,
             workspace: workspace_ref,
             trace_llm: trace_llm_ref,
+            extension_manager: ext_mgr_ref,
+            session_manager: session_manager_ref,
             _temp_dir: temp_dir,
         }
     }

@@ -116,9 +116,18 @@ pub fn load_ironclaw_env() {
             .join(".ironclaw")
             .join("ironclaw.db");
         if default_db.exists() {
-            // SAFETY: `load_ironclaw_env` is called from a synchronous `fn main()`
-            // before the Tokio runtime is started, so no other threads exist yet.
-            unsafe { std::env::set_var("DATABASE_BACKEND", "libsql") };
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Tokio runtime is active (multi-threaded); std::env::set_var is UB here.
+                // Fall back to the thread-safe runtime overlay so the value is always set.
+                tracing::warn!(
+                    "load_ironclaw_env called with active Tokio runtime; \
+                     using runtime env overlay for DATABASE_BACKEND"
+                );
+                crate::config::set_runtime_env("DATABASE_BACKEND", "libsql");
+            } else {
+                // SAFETY: No Tokio runtime = no other threads = safe to call set_var.
+                unsafe { std::env::set_var("DATABASE_BACKEND", "libsql") };
+            }
         }
     }
 }
@@ -194,6 +203,58 @@ pub fn save_bootstrap_env_to(path: &std::path::Path, vars: &[(&str, &str)]) -> s
         content.push_str(&format!("{}=\"{}\"\n", key, escaped));
     }
     std::fs::write(path, &content)?;
+    restrict_file_permissions(path)?;
+    Ok(())
+}
+
+/// Update or add multiple variables in `~/.ironclaw/.env`, preserving existing content.
+///
+/// Like `upsert_bootstrap_var` but batched — replaces lines for any key in `vars`
+/// and preserves all other existing lines. Use this instead of `save_bootstrap_env`
+/// when you want to update specific keys without destroying user-added variables.
+pub fn upsert_bootstrap_vars(vars: &[(&str, &str)]) -> std::io::Result<()> {
+    upsert_bootstrap_vars_to(&ironclaw_env_path(), vars)
+}
+
+/// Update or add multiple variables at an arbitrary path (testable variant).
+pub fn upsert_bootstrap_vars_to(
+    path: &std::path::Path,
+    vars: &[(&str, &str)],
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let keys_being_written: std::collections::HashSet<&str> =
+        vars.iter().map(|(k, _)| *k).collect();
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+
+    let mut result = String::new();
+    for line in existing.lines() {
+        // Extract key from lines matching `KEY=...`
+        let is_overwritten = line
+            .split_once('=')
+            .map(|(k, _)| keys_being_written.contains(k.trim()))
+            .unwrap_or(false);
+
+        if !is_overwritten {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+
+    // Append all new key=value pairs
+    for (key, value) in vars {
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        result.push_str(&format!("{}=\"{}\"\n", key, escaped));
+    }
+
+    std::fs::write(path, &result)?;
     restrict_file_permissions(path)?;
     Ok(())
 }
@@ -507,13 +568,11 @@ impl Drop for PidLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::helpers::lock_env;
     use std::process::Command;
-    use std::sync::Mutex;
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_save_and_load_database_url() {
@@ -608,8 +667,23 @@ INJECTED="pwned"#;
 
     #[test]
     fn test_ironclaw_env_path() {
-        let path = ironclaw_env_path();
-        assert!(path.ends_with(".ironclaw/.env"));
+        // Use compute_ironclaw_base_dir() directly to avoid LazyLock caching,
+        // which can be poisoned by whichever test initializes it first.
+        let _guard = lock_env();
+        let old_val = std::env::var("IRONCLAW_BASE_DIR").ok();
+        // SAFETY: Under lock_env(), no concurrent env access.
+        unsafe { std::env::remove_var("IRONCLAW_BASE_DIR") };
+
+        let path = compute_ironclaw_base_dir().join(".env");
+        assert!(
+            path.ends_with(".ironclaw/.env"),
+            "expected path ending with .ironclaw/.env, got: {}",
+            path.display()
+        );
+
+        if let Some(val) = old_val {
+            unsafe { std::env::set_var("IRONCLAW_BASE_DIR", val) };
+        }
     }
 
     #[test]
@@ -775,7 +849,7 @@ INJECTED="pwned"#;
 
     #[test]
     fn test_libsql_autodetect_sets_backend_when_db_exists() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let old_val = std::env::var("DATABASE_BACKEND").ok();
         // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
         unsafe { std::env::remove_var("DATABASE_BACKEND") };
@@ -846,7 +920,7 @@ INJECTED="pwned"#;
 
     #[test]
     fn test_libsql_autodetect_does_not_override_explicit_backend() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let old_val = std::env::var("DATABASE_BACKEND").ok();
         // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
         unsafe { std::env::set_var("DATABASE_BACKEND", "postgres") };
@@ -973,7 +1047,7 @@ INJECTED="pwned"#;
     fn test_ironclaw_base_dir_default() {
         // This test must run first (or in isolation) before the LazyLock is initialized.
         // It verifies that when IRONCLAW_BASE_DIR is not set, the default path is used.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let old_val = std::env::var("IRONCLAW_BASE_DIR").ok();
         // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
         unsafe { std::env::remove_var("IRONCLAW_BASE_DIR") };
@@ -993,7 +1067,7 @@ INJECTED="pwned"#;
     fn test_ironclaw_base_dir_env_override() {
         // This test verifies that when IRONCLAW_BASE_DIR is set,
         // the custom path is used. Must run before LazyLock is initialized.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let old_val = std::env::var("IRONCLAW_BASE_DIR").ok();
         // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
         unsafe { std::env::set_var("IRONCLAW_BASE_DIR", "/custom/ironclaw/path") };
@@ -1015,7 +1089,7 @@ INJECTED="pwned"#;
     fn test_compute_base_dir_env_path_join() {
         // Verifies that ironclaw_env_path correctly joins .env to the base dir.
         // Uses compute_ironclaw_base_dir directly to avoid LazyLock caching.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let old_val = std::env::var("IRONCLAW_BASE_DIR").ok();
         // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
         unsafe { std::env::set_var("IRONCLAW_BASE_DIR", "/my/custom/dir") };
@@ -1037,7 +1111,7 @@ INJECTED="pwned"#;
     #[test]
     fn test_ironclaw_base_dir_empty_env() {
         // Verifies that empty IRONCLAW_BASE_DIR falls back to default.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let old_val = std::env::var("IRONCLAW_BASE_DIR").ok();
         // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
         unsafe { std::env::set_var("IRONCLAW_BASE_DIR", "") };
@@ -1059,7 +1133,7 @@ INJECTED="pwned"#;
     #[test]
     fn test_ironclaw_base_dir_special_chars() {
         // Verifies that paths with special characters are handled correctly.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let old_val = std::env::var("IRONCLAW_BASE_DIR").ok();
         // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
         unsafe { std::env::set_var("IRONCLAW_BASE_DIR", "/tmp/test_with-special.chars") };
@@ -1236,5 +1310,109 @@ INJECTED="pwned"#;
         // After the child exits, lock should be released and reacquirable.
         let lock = PidLock::acquire_at(pid_path).unwrap();
         drop(lock);
+    }
+
+    #[test]
+    fn upsert_bootstrap_vars_preserves_unknown_keys() {
+        let dir = tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+
+        // Simulate a user-edited .env with custom vars
+        let initial =
+            "HTTP_HOST=\"0.0.0.0\"\nDATABASE_BACKEND=\"postgres\"\nCUSTOM_VAR=\"keep_me\"\n";
+        std::fs::write(&env_path, initial).unwrap();
+
+        // Upsert wizard vars — should preserve HTTP_HOST and CUSTOM_VAR
+        let vars = [("DATABASE_BACKEND", "libsql"), ("LLM_BACKEND", "openai")];
+        upsert_bootstrap_vars_to(&env_path, &vars).unwrap();
+
+        let parsed: Vec<(String, String)> = dotenvy::from_path_iter(&env_path)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(
+            parsed.len(),
+            4,
+            "should have 4 vars (2 preserved + 2 upserted)"
+        );
+
+        // User-added vars must be preserved
+        assert!(
+            parsed
+                .iter()
+                .any(|(k, v)| k == "HTTP_HOST" && v == "0.0.0.0"),
+            "HTTP_HOST must be preserved"
+        );
+        assert!(
+            parsed
+                .iter()
+                .any(|(k, v)| k == "CUSTOM_VAR" && v == "keep_me"),
+            "CUSTOM_VAR must be preserved"
+        );
+
+        // Wizard vars must be updated/added
+        assert!(
+            parsed
+                .iter()
+                .any(|(k, v)| k == "DATABASE_BACKEND" && v == "libsql"),
+            "DATABASE_BACKEND must be updated to libsql"
+        );
+        assert!(
+            parsed
+                .iter()
+                .any(|(k, v)| k == "LLM_BACKEND" && v == "openai"),
+            "LLM_BACKEND must be added"
+        );
+
+        // Now update LLM_BACKEND and verify HTTP_HOST still preserved
+        let vars2 = [("LLM_BACKEND", "anthropic")];
+        upsert_bootstrap_vars_to(&env_path, &vars2).unwrap();
+
+        let parsed2: Vec<(String, String)> = dotenvy::from_path_iter(&env_path)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(
+            parsed2.len(),
+            4,
+            "should still have 4 vars after second upsert"
+        );
+        assert!(
+            parsed2
+                .iter()
+                .any(|(k, v)| k == "HTTP_HOST" && v == "0.0.0.0"),
+            "HTTP_HOST must still be preserved after second upsert"
+        );
+        assert!(
+            parsed2
+                .iter()
+                .any(|(k, v)| k == "LLM_BACKEND" && v == "anthropic"),
+            "LLM_BACKEND must be updated to anthropic"
+        );
+    }
+
+    #[test]
+    fn upsert_bootstrap_vars_creates_file_if_missing() {
+        let dir = tempdir().unwrap();
+        let env_path = dir.path().join("subdir").join(".env");
+
+        // File doesn't exist yet
+        assert!(!env_path.exists());
+
+        let vars = [("DATABASE_BACKEND", "libsql")];
+        upsert_bootstrap_vars_to(&env_path, &vars).unwrap();
+
+        assert!(env_path.exists());
+        let parsed: Vec<(String, String)> = dotenvy::from_path_iter(&env_path)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0],
+            ("DATABASE_BACKEND".to_string(), "libsql".to_string())
+        );
     }
 }

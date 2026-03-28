@@ -87,23 +87,21 @@ _REGISTRY_MCP = {
     "installed": False,
 }
 
-_SAMPLE_TOOL = {"name": "echo", "description": "Echo a message"}
-_SAMPLE_TOOL_2 = {"name": "time", "description": "Get current time"}
-
 
 # ─── Navigation helpers ────────────────────────────────────────────────────────
 
 async def go_to_extensions(page):
-    """Click the Extensions tab and wait for the panel to appear.
+    """Navigate to Settings > Extensions subtab and wait for content.
 
     Waits for loadExtensions() to finish rendering by polling for the first
     content signal (empty-state div or an installed card) rather than sleeping.
     """
-    await page.locator(SEL["tab_button"].format(tab="extensions")).click()
-    await page.locator(SEL["tab_panel"].format(tab="extensions")).wait_for(
+    await page.locator(SEL["tab_button"].format(tab="settings")).click()
+    await page.locator(SEL["settings_subtab"].format(subtab="extensions")).click()
+    await page.locator(SEL["settings_subpanel"].format(subtab="extensions")).wait_for(
         state="visible", timeout=5000
     )
-    # loadExtensions() fires three parallel fetches then renders. Wait for the
+    # loadExtensions() fires parallel fetches then renders. Wait for the
     # first concrete DOM signal instead of a hard sleep so the test is
     # deterministic even under CI load.
     await page.locator(
@@ -111,19 +109,39 @@ async def go_to_extensions(page):
     ).first.wait_for(state="visible", timeout=8000)
 
 
-async def mock_ext_apis(page, *, installed=None, tools=None, registry=None):
-    """Intercept the three extension list APIs with fixture data.
+async def go_to_channels(page):
+    """Navigate to Settings > Channels subtab and wait for content."""
+    await page.locator(SEL["tab_button"].format(tab="settings")).click()
+    await page.locator(SEL["settings_subtab"].format(subtab="channels")).click()
+    await page.locator(SEL["settings_subpanel"].format(subtab="channels")).wait_for(
+        state="visible", timeout=5000
+    )
 
-    Must be called BEFORE navigating to the extensions tab.
+
+async def go_to_mcp(page):
+    """Navigate to Settings > MCP subtab and wait for content."""
+    await page.locator(SEL["tab_button"].format(tab="settings")).click()
+    await page.locator(SEL["settings_subtab"].format(subtab="mcp")).click()
+    await page.locator(SEL["settings_subpanel"].format(subtab="mcp")).wait_for(
+        state="visible", timeout=5000
+    )
+    await page.locator(
+        f"{SEL['mcp_servers_list']} .empty-state, {SEL['ext_card_mcp']}"
+    ).first.wait_for(state="visible", timeout=8000)
+
+
+async def mock_ext_apis(page, *, installed=None, registry=None):
+    """Intercept the extension list APIs with fixture data.
+
+    Must be called BEFORE navigating to the extensions subtab.
     """
     ext_body = json.dumps({"extensions": installed or []})
-    tools_body = json.dumps({"tools": tools or []})
     registry_body = json.dumps({"entries": registry or []})
 
     # Playwright evaluates route handlers in LIFO order (last-registered fires
     # first). Register the broad handler first so it is checked last; the
-    # specific /tools and /registry handlers are registered after and therefore
-    # checked first — no continue_() fallthrough needed.
+    # specific /registry handler is registered after and therefore checked
+    # first — no continue_() fallthrough needed.
     async def handle_ext_list(route):
         path = route.request.url.split("?")[0]
         if path.endswith("/api/extensions"):
@@ -133,13 +151,9 @@ async def mock_ext_apis(page, *, installed=None, tools=None, registry=None):
 
     await page.route("**/api/extensions*", handle_ext_list)
 
-    async def handle_tools(route):
-        await route.fulfill(status=200, content_type="application/json", body=tools_body)
-
     async def handle_registry(route):
         await route.fulfill(status=200, content_type="application/json", body=registry_body)
 
-    await page.route("**/api/extensions/tools", handle_tools)
     await page.route("**/api/extensions/registry", handle_registry)
 
 
@@ -151,45 +165,16 @@ async def wait_for_toast(page, text: str, *, timeout: int = 5000):
 # ─── Group A: Structural / empty state ────────────────────────────────────────
 
 async def test_extensions_empty_tab_layout(page):
-    """Extensions tab with no data shows all three sections with correct empty-state messages."""
-    await mock_ext_apis(page, tools=[])
+    """Extensions subtab with no data shows sections with correct empty-state messages."""
+    await mock_ext_apis(page)
     await go_to_extensions(page)
 
-    panel = page.locator(SEL["tab_panel"].format(tab="extensions"))
+    panel = page.locator(SEL["settings_subpanel"].format(subtab="extensions"))
     assert await panel.is_visible()
 
     ext_list = page.locator(SEL["extensions_list"])
     assert await ext_list.is_visible()
     assert "No extensions installed" in await ext_list.text_content()
-
-    wasm_list = page.locator(SEL["available_wasm_list"])
-    assert await wasm_list.is_visible()
-    assert "No additional WASM extensions available" in await wasm_list.text_content()
-
-    mcp_list = page.locator(SEL["mcp_servers_list"])
-    assert await mcp_list.is_visible()
-    assert "No MCP servers available" in await mcp_list.text_content()
-
-    # Tools table should be empty
-    tbody = page.locator(SEL["tools_tbody"])
-    rows = await tbody.locator("tr").count()
-    empty_visible = await page.locator(SEL["tools_empty"]).is_visible()
-    assert empty_visible or rows == 0, "Expected tools table to be empty"
-
-
-async def test_extensions_tools_table_populated(page):
-    """Two mock tools produce two rows in the tools table."""
-    await mock_ext_apis(page, tools=[_SAMPLE_TOOL, _SAMPLE_TOOL_2])
-    await go_to_extensions(page)
-
-    tbody = page.locator(SEL["tools_tbody"])
-    rows = tbody.locator("tr")
-    await rows.first.wait_for(state="visible", timeout=5000)
-    assert await rows.count() == 2
-
-    text = await tbody.text_content()
-    assert "echo" in text
-    assert "time" in text
 
 
 # ─── Group B: Installed WASM tool cards ───────────────────────────────────────
@@ -248,9 +233,9 @@ async def test_installed_wasm_tool_authed_shows_reconfigure_btn(page):
 async def test_installed_mcp_server_active(page):
     """Active MCP server shows 'Active' label and no Activate button."""
     await mock_ext_apis(page, installed=[_MCP_ACTIVE])
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
-    card = page.locator(SEL["ext_card_installed"]).first
+    card = page.locator(SEL["ext_card_mcp"]).first
     await card.wait_for(state="visible", timeout=5000)
     assert await card.locator(SEL["ext_active_label"]).count() == 1
     assert await card.locator(SEL["ext_activate_btn"]).count() == 0
@@ -260,9 +245,9 @@ async def test_installed_mcp_server_active(page):
 async def test_installed_mcp_server_inactive_shows_activate(page):
     """Inactive MCP server shows Activate button."""
     await mock_ext_apis(page, installed=[_MCP_INACTIVE])
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
-    card = page.locator(SEL["ext_card_installed"]).first
+    card = page.locator(SEL["ext_card_mcp"]).first
     await card.wait_for(state="visible", timeout=5000)
     assert await card.locator(SEL["ext_activate_btn"]).count() == 1
 
@@ -270,7 +255,7 @@ async def test_installed_mcp_server_inactive_shows_activate(page):
 async def test_mcp_server_in_registry_not_installed(page):
     """Registry MCP entry (not installed) appears in the MCP section with Install button."""
     await mock_ext_apis(page, registry=[_REGISTRY_MCP])
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
     mcp_list = page.locator(SEL["mcp_servers_list"])
     card = mcp_list.locator(".ext-card").first
@@ -285,7 +270,7 @@ async def test_mcp_server_installed_auth_dot(page):
     installed_mcp = {**_MCP_ACTIVE, "name": "registry-mcp", "authenticated": False}
     registry_mcp = {**_REGISTRY_MCP, "name": "registry-mcp"}
     await mock_ext_apis(page, installed=[installed_mcp], registry=[registry_mcp])
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
     mcp_list = page.locator(SEL["mcp_servers_list"])
     card = mcp_list.locator(".ext-card").first
@@ -299,8 +284,9 @@ async def test_mcp_server_installed_auth_dot(page):
 async def _load_wasm_channel(page, activation_status, activation_error=None):
     ext = {**_WASM_CHANNEL, "activation_status": activation_status, "activation_error": activation_error}
     await mock_ext_apis(page, installed=[ext])
-    await go_to_extensions(page)
-    card = page.locator(SEL["ext_card_installed"]).first
+    await go_to_channels(page)
+    # Find the WASM channel card specifically (not built-in channel cards)
+    card = page.locator(SEL["channels_ext_card"], has_text="Test Channel").first
     await card.wait_for(state="visible", timeout=5000)
     return card
 
@@ -446,9 +432,9 @@ async def test_install_wasm_channel_triggers_configure(page):
 
     await page.route("**/api/extensions/test-channel/setup", handle_channel_setup)
     await page.route("**/api/extensions/install", handle_channel_install)
-    await go_to_extensions(page)
+    await go_to_channels(page)
 
-    install_btn = page.locator(SEL["available_wasm_list"]).locator(SEL["ext_install_btn"]).first
+    install_btn = page.locator(SEL["channels_ext_card"]).locator(SEL["ext_install_btn"]).first
     await install_btn.wait_for(state="visible", timeout=5000)
     await install_btn.click()
 
@@ -456,6 +442,37 @@ async def test_install_wasm_channel_triggers_configure(page):
     modal = page.locator(SEL["configure_modal"])
     await modal.wait_for(state="visible", timeout=8000)
     assert await modal.is_visible()
+
+
+async def test_install_with_auth_url_opens_popup_and_shows_auth_prompt(page):
+    """Install responses with auth_url should surface the same auth prompt used elsewhere."""
+    await page.evaluate("window.open = (url) => { window._lastOpenedUrl = url; }")
+    await mock_ext_apis(page, registry=[_REGISTRY_WASM])
+
+    async def handle_install(route):
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"success": True, "auth_url": "https://example.com/oauth"}),
+        )
+
+    await page.route("**/api/extensions/install", handle_install)
+    await go_to_extensions(page)
+
+    install_btn = page.locator(SEL["available_wasm_list"]).locator(SEL["ext_install_btn"]).first
+    await install_btn.wait_for(state="visible", timeout=5000)
+    await install_btn.click()
+
+    await page.wait_for_function(
+        "() => window._lastOpenedUrl !== null && window._lastOpenedUrl !== undefined",
+        timeout=5000,
+    )
+    opened = await page.evaluate("window._lastOpenedUrl")
+    assert opened is not None, "window.open was not called"
+    assert "example.com" in opened
+    await page.locator(SEL["auth_card"] + '[data-extension-name="registry-tool"]').wait_for(
+        state="visible", timeout=5000
+    )
 
 
 # ─── Group F: Remove flow ─────────────────────────────────────────────────────
@@ -492,12 +509,13 @@ async def test_remove_installed_extension_confirmed(page):
     # Override for subsequent calls
     await page.route("**/api/extensions*", handle_ext_empty)
 
-    # Auto-accept confirm dialog
-    await page.evaluate("window.confirm = () => true")
-
     card = page.locator(SEL["ext_card_installed"]).first
     await card.wait_for(state="visible", timeout=5000)
     await card.locator(SEL["ext_remove_btn"]).click()
+
+    # Confirm via custom modal
+    await page.locator(SEL["confirm_modal"]).wait_for(state="visible", timeout=5000)
+    await page.locator(SEL["confirm_modal_btn"]).click()
 
     # Card should disappear
     await page.wait_for_function(
@@ -512,12 +530,13 @@ async def test_remove_cancelled_keeps_card(page):
     await mock_ext_apis(page, installed=[_WASM_TOOL])
     await go_to_extensions(page)
 
-    # Reject the confirm dialog
-    await page.evaluate("window.confirm = () => false")
-
     card = page.locator(SEL["ext_card_installed"]).first
     await card.wait_for(state="visible", timeout=5000)
     await card.locator(SEL["ext_remove_btn"]).click()
+
+    # Cancel via custom modal
+    await page.locator(SEL["confirm_modal"]).wait_for(state="visible", timeout=5000)
+    await page.locator(SEL["confirm_modal_cancel"]).click()
 
     assert await page.locator(SEL["ext_card_installed"]).count() >= 1, "Card should remain after cancel"
 
@@ -612,7 +631,7 @@ async def test_configure_modal_save_success(page):
 
 
 async def test_configure_modal_save_oauth(page):
-    """Save response with auth_url opens a popup via window.open."""
+    """Save response with auth_url opens a popup and shows the global auth prompt."""
     await page.evaluate("window.open = (url) => { window._lastOpenedUrl = url; }")
 
     async def handle_setup(route):
@@ -639,6 +658,9 @@ async def test_configure_modal_save_oauth(page):
     opened = await page.evaluate("window._lastOpenedUrl")
     assert opened is not None, "window.open was not called"
     assert "oauth" in opened or "example.com" in opened
+    await page.locator(SEL["auth_card"] + '[data-extension-name="test-ext"]').wait_for(
+        state="visible", timeout=5000
+    )
 
 
 async def test_configure_modal_save_failure(page):
@@ -699,7 +721,7 @@ async def test_configure_modal_enter_key_submits(page):
 # ─── Group H: Auth card (SSE-triggered) ───────────────────────────────────────
 
 async def _show_auth_card(page, **kwargs):
-    """Inject an auth card via JS and wait for it to appear."""
+    """Inject the global auth prompt via JS and wait for it to appear."""
     payload = json.dumps(kwargs)
     await page.evaluate(f"showAuthCard({payload})")
     await page.locator(SEL["auth_card"]).wait_for(state="visible", timeout=5000)
@@ -812,12 +834,73 @@ async def test_auth_card_replaces_existing_same_extension(page):
     assert "Second" in await page.locator(SEL["auth_instructions"]).text_content()
 
 
-async def test_auth_card_multiple_extensions_coexist(page):
-    """Auth cards for different extensions can coexist."""
+async def test_auth_card_for_different_extension_replaces_existing_prompt(page):
+    """A new auth prompt replaces the previous one to keep the UX modal and global."""
     await page.evaluate('showAuthCard({extension_name: "ext-a", instructions: "Token A"})')
     await page.evaluate('showAuthCard({extension_name: "ext-b", instructions: "Token B"})')
-    await page.locator(SEL["auth_card"]).nth(1).wait_for(state="visible", timeout=3000)
-    assert await page.locator(SEL["auth_card"]).count() == 2
+    await page.locator(SEL["auth_card"]).wait_for(state="visible", timeout=3000)
+    assert await page.locator(SEL["auth_card"]).count() == 1
+    assert await page.locator(SEL["auth_card"] + '[data-extension-name="ext-a"]').count() == 0
+    assert await page.locator(SEL["auth_card"] + '[data-extension-name="ext-b"]').count() == 1
+
+
+async def test_auth_and_configure_helpers_escape_selector_sensitive_extension_names(page):
+    """Quoted extension names should not break auth/configure modal helpers."""
+    result = await page.evaluate(
+        """({ name }) => {
+            showAuthCard({ extension_name: name, instructions: 'Paste token' });
+            showAuthCardError(name, 'Bad token');
+            const errorText = document.querySelector('.auth-error')?.textContent || '';
+            removeAuthCard(name);
+            const authStillPresent = Array.from(document.querySelectorAll('.auth-card'))
+              .some((card) => card.getAttribute('data-extension-name') === name);
+
+            const overlay = document.createElement('div');
+            overlay.className = 'configure-overlay';
+            overlay.setAttribute('data-extension-name', name);
+            document.body.appendChild(overlay);
+            closeConfigureModal(name);
+            const configureStillPresent = Array.from(document.querySelectorAll('.configure-overlay'))
+              .some((node) => node.getAttribute('data-extension-name') === name);
+
+            return { errorText, authStillPresent, configureStillPresent };
+        }""",
+        {"name": 'quoted "ext" name'},
+    )
+
+    assert result["errorText"] == "Bad token"
+    assert result["authStillPresent"] is False
+    assert result["configureStillPresent"] is False
+
+
+async def test_auth_required_does_not_reopen_existing_configure_modal(page):
+    """Regression: auth_required SSE should not clobber an already-open configure modal."""
+    result = await page.evaluate(
+        """() => {
+            const overlay = document.createElement('div');
+            overlay.className = 'configure-overlay';
+            overlay.setAttribute('data-extension-name', 'telegram');
+            document.body.appendChild(overlay);
+
+            const originalShowConfigureModal = window.showConfigureModal;
+            const originalSetAuthFlowPending = window.setAuthFlowPending;
+            let showCalls = 0;
+            let pendingCalls = 0;
+
+            window.showConfigureModal = () => { showCalls += 1; };
+            window.setAuthFlowPending = () => { pendingCalls += 1; };
+
+            handleAuthRequired({ extension_name: 'telegram', instructions: 'pending', auth_url: null });
+
+            window.showConfigureModal = originalShowConfigureModal;
+            window.setAuthFlowPending = originalSetAuthFlowPending;
+            overlay.remove();
+            return { showCalls, pendingCalls };
+        }"""
+    )
+
+    assert result["showCalls"] == 0
+    assert result["pendingCalls"] == 0
 
 
 async def test_auth_completed_sse_dismisses_card(page):
@@ -826,11 +909,89 @@ async def test_auth_completed_sse_dismisses_card(page):
 
     # Simulate the auth_completed SSE event being fired
     await page.evaluate("""
-        // Call the handler the same way the SSE listener does
-        removeAuthCard('myext');
+        handleAuthCompleted({
+          extension_name: 'myext',
+          success: true,
+          message: 'Authenticated!',
+        });
     """)
 
     assert await page.locator(SEL["auth_card"] + '[data-extension-name="myext"]').count() == 0
+
+
+async def test_auth_completed_for_other_extension_keeps_configure_modal_open(page):
+    """Auth completion should not close a different extension's configure modal."""
+    async def handle_setup(route):
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"secrets": [{"name": "token", "prompt": "Token", "provided": False, "optional": False, "auto_generate": False}]}),
+        )
+
+    await page.route("**/api/extensions/test-ext/setup", handle_setup)
+    await page.evaluate("showConfigureModal('test-ext')")
+    await page.locator(SEL["configure_modal"]).wait_for(state="visible", timeout=5000)
+
+    await page.evaluate("""
+        handleAuthCompleted({
+          extension_name: 'other-ext',
+          success: true,
+          message: 'Other extension connected.',
+        });
+    """)
+
+    assert await page.locator(SEL["configure_overlay"]).is_visible(), (
+        "Configure modal should remain open when another extension finishes auth"
+    )
+
+
+async def test_auth_completed_failure_sse_shows_error_toast_and_reloads_extensions(page):
+    """Failed auth_completed handling should clear stale UI and refresh extensions."""
+    reload_count = []
+
+    async def counting_handler(route):
+        path = route.request.url.split("?")[0]
+        if path.endswith("/api/extensions"):
+            reload_count.append(1)
+            await route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"extensions": []}),
+            )
+        else:
+            await route.continue_()
+
+    async def handle_registry(route):
+        await route.fulfill(status=200, content_type="application/json", body='{"entries":[]}')
+
+    await page.route("**/api/extensions*", counting_handler)
+    await page.route("**/api/extensions/registry", handle_registry)
+
+    await go_to_extensions(page)
+    count_before = len(reload_count)
+
+    await _show_auth_card(page, extension_name="gmail", auth_url="https://example.com/oauth")
+    assert await page.locator(SEL["auth_card"] + '[data-extension-name="gmail"]').count() == 1
+
+    # Inject a counter to confirm refreshCurrentSettingsTab is called
+    await page.evaluate("window.__refreshCount = 0; var _origRefresh = refreshCurrentSettingsTab; refreshCurrentSettingsTab = function() { window.__refreshCount++; _origRefresh(); };")
+
+    await page.evaluate("""
+        handleAuthCompleted({
+          extension_name: 'gmail',
+          success: false,
+          message: 'OAuth flow expired. Please try again.',
+        });
+    """)
+
+    await wait_for_toast(page, "OAuth flow expired. Please try again.")
+    assert await page.locator(SEL["auth_card"] + '[data-extension-name="gmail"]').count() == 0
+
+    # Wait for the refresh to complete
+    await page.wait_for_function("() => window.__refreshCount > 0", timeout=5000)
+    # Give the async fetch time to complete
+    await page.wait_for_timeout(1000)
+    assert len(reload_count) > count_before, "Extensions list did not reload after auth failure"
 
 
 # ─── Group I: Activate flow ────────────────────────────────────────────────────
@@ -849,9 +1010,9 @@ async def test_activate_mcp_server_success(page):
 
     await mock_ext_apis(page, installed=[_MCP_INACTIVE])
     await page.route("**/api/extensions/test-mcp-inactive/activate", handle_activate)
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
-    activate_btn = page.locator(SEL["ext_card_installed"]).first.locator(SEL["ext_activate_btn"])
+    activate_btn = page.locator(SEL["ext_card_mcp"]).first.locator(SEL["ext_activate_btn"])
     await activate_btn.wait_for(state="visible", timeout=5000)
 
     async with page.expect_response("**/api/extensions/test-mcp-inactive/activate", timeout=5000):
@@ -874,9 +1035,9 @@ async def test_activate_awaiting_token_opens_configure(page):
 
     await page.route("**/api/extensions/test-mcp-inactive/activate", handle_activate)
     await page.route("**/api/extensions/test-mcp-inactive/setup", handle_setup)
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
-    activate_btn = page.locator(SEL["ext_card_installed"]).first.locator(SEL["ext_activate_btn"])
+    activate_btn = page.locator(SEL["ext_card_mcp"]).first.locator(SEL["ext_activate_btn"])
     await activate_btn.wait_for(state="visible", timeout=5000)
     await activate_btn.click()
 
@@ -893,17 +1054,17 @@ async def test_activate_failure_shows_error_toast(page):
         await route.fulfill(status=200, content_type="application/json", body=json.dumps({"success": False, "message": "Config missing"}))
 
     await page.route("**/api/extensions/test-mcp-inactive/activate", handle_activate)
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
-    activate_btn = page.locator(SEL["ext_card_installed"]).first.locator(SEL["ext_activate_btn"])
+    activate_btn = page.locator(SEL["ext_card_mcp"]).first.locator(SEL["ext_activate_btn"])
     await activate_btn.wait_for(state="visible", timeout=5000)
     await activate_btn.click()
 
     await wait_for_toast(page, "Config missing")
 
 
-async def test_activate_with_auth_url_opens_popup(page):
-    """Activate response with auth_url calls window.open."""
+async def test_activate_with_auth_url_opens_popup_and_shows_auth_prompt(page):
+    """Activate response with auth_url calls window.open and shows the auth prompt."""
     await page.evaluate("window.open = (url) => { window._lastOpenedUrl = url; }")
     await mock_ext_apis(page, installed=[_MCP_INACTIVE])
 
@@ -911,9 +1072,9 @@ async def test_activate_with_auth_url_opens_popup(page):
         await route.fulfill(status=200, content_type="application/json", body=json.dumps({"success": True, "auth_url": "https://example.com/oauth"}))
 
     await page.route("**/api/extensions/test-mcp-inactive/activate", handle_activate)
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
-    activate_btn = page.locator(SEL["ext_card_installed"]).first.locator(SEL["ext_activate_btn"])
+    activate_btn = page.locator(SEL["ext_card_mcp"]).first.locator(SEL["ext_activate_btn"])
     await activate_btn.wait_for(state="visible", timeout=5000)
     await activate_btn.click()
 
@@ -921,12 +1082,15 @@ async def test_activate_with_auth_url_opens_popup(page):
     opened = await page.evaluate("window._lastOpenedUrl")
     assert opened is not None, "window.open was not called"
     assert "example.com" in opened
+    await page.locator(
+        SEL["auth_card"] + '[data-extension-name="test-mcp-inactive"]'
+    ).wait_for(state="visible", timeout=5000)
 
 
 # ─── Group J: Tab reload behaviour ────────────────────────────────────────────
 
 async def test_extensions_tab_reloads_on_revisit(page):
-    """loadExtensions() is called again when re-navigating to the extensions tab."""
+    """loadExtensions() is called again when re-navigating to the extensions subtab."""
     call_count = []
 
     async def counting_handler(route):
@@ -941,15 +1105,11 @@ async def test_extensions_tab_reloads_on_revisit(page):
         else:
             await route.continue_()
 
-    async def handle_tools(route):
-        await route.fulfill(status=200, content_type="application/json", body='{"tools":[]}')
-
     async def handle_registry(route):
         await route.fulfill(status=200, content_type="application/json", body='{"entries":[]}')
 
-    await page.route("**/api/extensions/tools", handle_tools)
-    await page.route("**/api/extensions/registry", handle_registry)
     await page.route("**/api/extensions*", counting_handler)
+    await page.route("**/api/extensions/registry", handle_registry)
 
     # First visit
     await go_to_extensions(page)
@@ -966,47 +1126,6 @@ async def test_extensions_tab_reloads_on_revisit(page):
     await go_to_extensions(page)
     count_after_second = len(call_count)
     assert count_after_second > count_after_first, "loadExtensions not called on return visit"
-
-
-async def test_auth_completed_sse_triggers_extensions_reload(page):
-    """auth_completed SSE event while on the extensions tab triggers a reload."""
-    reload_count = []
-
-    async def counting_handler(route):
-        path = route.request.url.split("?")[0]
-        if path.endswith("/api/extensions"):
-            reload_count.append(1)
-            await route.fulfill(
-                status=200,
-                content_type="application/json",
-                body=json.dumps({"extensions": []}),
-            )
-        else:
-            await route.continue_()
-
-    async def handle_tools(route):
-        await route.fulfill(status=200, content_type="application/json", body='{"tools":[]}')
-
-    async def handle_registry(route):
-        await route.fulfill(status=200, content_type="application/json", body='{"entries":[]}')
-
-    await page.route("**/api/extensions/tools", handle_tools)
-    await page.route("**/api/extensions/registry", handle_registry)
-    await page.route("**/api/extensions*", counting_handler)
-
-    await go_to_extensions(page)
-    count_before = len(reload_count)
-
-    # Simulate auth_completed by calling loadExtensions directly (as the SSE handler does)
-    await page.evaluate("""
-        // Simulate what the auth_completed SSE handler does when currentTab === 'extensions'
-        if (typeof loadExtensions === 'function') {
-            loadExtensions();
-        }
-    """)
-
-    await page.wait_for_timeout(600)
-    assert len(reload_count) > count_before, "loadExtensions was not called after auth_completed"
 
 
 # ─── Regression tests ─────────────────────────────────────────────────────────
@@ -1086,9 +1205,9 @@ async def test_oauth_url_injection_blocked(page):
         )
 
     await page.route("**/api/extensions/test-mcp-inactive/activate", handle_activate)
-    await go_to_extensions(page)
+    await go_to_mcp(page)
 
-    activate_btn = page.locator(SEL["ext_card_installed"]).first.locator(SEL["ext_activate_btn"])
+    activate_btn = page.locator(SEL["ext_card_mcp"]).first.locator(SEL["ext_activate_btn"])
     await activate_btn.wait_for(state="visible", timeout=5000)
     await activate_btn.click()
 

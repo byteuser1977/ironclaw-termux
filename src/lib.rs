@@ -54,10 +54,13 @@ pub mod evaluation;
 pub mod extensions;
 pub mod history;
 pub mod hooks;
+#[cfg(feature = "import")]
+pub mod import;
 pub mod llm;
 pub mod observability;
 pub mod orchestrator;
 pub mod pairing;
+pub mod profile;
 pub mod registry;
 pub mod safety;
 pub mod sandbox;
@@ -66,12 +69,13 @@ pub mod service;
 pub mod settings;
 pub mod setup;
 pub mod skills;
+pub mod tenant;
 pub mod timezone;
 pub mod tools;
 pub mod tracing_fmt;
-pub mod transcription;
 pub mod tunnel;
 pub mod util;
+pub mod webhooks;
 pub mod worker;
 pub mod workspace;
 

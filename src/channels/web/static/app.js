@@ -68,7 +68,7 @@ document.getElementById('settings-theme-toggle')?.addEventListener('click', () =
   const btn = document.getElementById('settings-theme-toggle');
   if (btn) {
     const mode = localStorage.getItem('ironclaw-theme') || 'system';
-    btn.textContent = 'Theme: ' + mode.charAt(0).toUpperCase() + mode.slice(1);
+    btn.textContent = I18n.t('theme.label', { mode: mode.charAt(0).toUpperCase() + mode.slice(1) });
   }
 });
 
@@ -105,9 +105,22 @@ const STREAM_DEBOUNCE_MS = 50;
 let _connectionLostTimer = null;
 let _connectionLostAt = null;
 let _reconnectAttempts = 0;
+let _lastSseEventId = null;
+
+// --- Turn Response Tracking State ---
+// Safety net for lost SSE response events (see #2079): tracks whether we
+// received a `response` event for the current turn so that a "Done" status
+// arriving without one can trigger a history reload.
+const DONE_WITHOUT_RESPONSE_TIMEOUT_MS = 1500;
+// Single-thread tracking is intentional: background thread events are already
+// filtered out by `isCurrentThread`, so only the active thread's turn state
+// matters here. Per-thread state is unnecessary.
+let _turnResponseReceived = false;
+let _doneWithoutResponseTimer = null;
 
 // --- Send Cooldown State ---
 let _sendCooldown = false;
+let _recentLocalPairingApprovals = new Map();
 
 // --- Slash Commands ---
 
@@ -171,12 +184,37 @@ function initApp() {
   connectSSE();
   connectLogSSE();
   startGatewayStatusPolling();
-  // Hide the Users settings tab for non-admin users.
+  // Fetch user profile and render avatar + account menu.
   apiFetch('/api/profile').then(function(profile) {
-    if (profile && profile.role !== 'admin') {
+    if (!profile) return;
+    window._currentUser = profile;
+    // Hide admin tabs for non-admin users.
+    if (profile.role !== 'admin') {
       var usersTab = document.querySelector('[data-settings-subtab="users"]');
       if (usersTab) usersTab.style.display = 'none';
     }
+    // Render avatar.
+    var avatarImg = document.getElementById('user-avatar-img');
+    var avatarInitials = document.getElementById('user-avatar-initials');
+    var displayName = profile.display_name || profile.email || profile.id || '?';
+    if (avatarInitials) {
+      avatarInitials.textContent = displayName.charAt(0).toUpperCase();
+    }
+    if (profile.avatar_url && avatarImg) {
+      avatarImg.referrerPolicy = 'no-referrer';
+      avatarImg.onload = function() {
+        if (avatarInitials) avatarInitials.style.display = 'none';
+      };
+      avatarImg.src = profile.avatar_url;
+      avatarImg.removeAttribute('hidden');
+    }
+    // Populate dropdown.
+    var nameEl = document.getElementById('user-dropdown-name');
+    var emailEl = document.getElementById('user-dropdown-email');
+    var roleEl = document.getElementById('user-dropdown-role');
+    if (nameEl) nameEl.textContent = profile.display_name || profile.id;
+    if (emailEl) emailEl.textContent = profile.email || '';
+    if (roleEl) roleEl.textContent = profile.role;
   }).catch(function() {});
   checkTeeStatus();
   loadThreads();
@@ -201,7 +239,7 @@ function authenticate() {
   const connectBtn = document.getElementById('auth-connect-btn');
   if (connectBtn) {
     connectBtn.disabled = true;
-    connectBtn.textContent = 'Connecting...';
+    connectBtn.textContent = I18n.t('auth.connecting');
   }
 
   // Test the token against the health-ish endpoint (chat/threads requires auth)
@@ -219,7 +257,7 @@ function authenticate() {
       // Reset Connect button on error
       if (connectBtn) {
         connectBtn.disabled = false;
-        connectBtn.textContent = 'Connect';
+        connectBtn.textContent = I18n.t('auth.connect');
       }
     });
 }
@@ -227,6 +265,147 @@ function authenticate() {
 document.getElementById('token-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') authenticate();
 });
+
+// Close SSE connections on page unload to free the browser's connection pool.
+// Without this, stale SSE connections from prior page loads linger and exhaust
+// the HTTP/1.1 per-origin connection limit (6), blocking API fetch calls.
+window.addEventListener('beforeunload', () => {
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (logEventSource) { logEventSource.close(); logEventSource = null; }
+});
+
+// Pause SSE when the browser tab is hidden (another tab is focused) and resume
+// when it becomes visible again. This frees connection slots for other tabs
+// running the gateway — without this, each tab holds 1-2 SSE connections and
+// the 3rd tab exhausts the browser's per-origin limit.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (eventSource) { eventSource.close(); eventSource = null; }
+    if (logEventSource) { logEventSource.close(); logEventSource = null; }
+  } else if (token) {
+    connectSSE();
+    if (currentTab === 'logs') connectLogSSE();
+  }
+});
+
+// --- Social login (OAuth + NEAR wallet) ---
+
+// Show the token form (used as fallback when no OAuth providers are available).
+function showTokenForm() {
+  var tokenForm = document.getElementById('auth-token-form');
+  if (tokenForm) {
+    tokenForm.style.display = '';
+    var input = document.getElementById('token-input');
+    if (input) input.focus();
+  }
+}
+
+// Discover enabled providers and show corresponding buttons.
+fetch('/auth/providers', { credentials: 'include' })
+  .then(function(r) { return r.ok ? r.json() : { providers: [] }; })
+  .then(function(data) {
+    var providers = data.providers || [];
+    if (providers.length === 0) { showTokenForm(); return; }
+    // Store NEAR network for the wallet connector.
+    if (data.near_network) window._nearNetwork = data.near_network;
+    var social = document.getElementById('auth-social');
+    if (social) social.style.display = '';
+    providers.forEach(function(p) {
+      var btn = document.getElementById('auth-' + p + '-btn');
+      if (!btn) return;
+      btn.style.display = '';
+      if (p === 'near') {
+        btn.addEventListener('click', authenticateWithNear);
+      } else {
+        btn.addEventListener('click', function() { window.location = '/auth/login/' + p; });
+      }
+    });
+    // When social providers are available, collapse the token form
+    // and show the "or use a token" divider instead.
+    var tokenForm = document.getElementById('auth-token-form');
+    var tokenDivider = document.getElementById('auth-token-divider');
+    if (tokenForm && tokenDivider) {
+      tokenForm.style.display = 'none';
+      tokenDivider.style.display = '';
+      tokenDivider.style.cursor = 'pointer';
+      tokenDivider.addEventListener('click', function() {
+        tokenForm.style.display = '';
+        tokenDivider.style.display = 'none';
+        var input = document.getElementById('token-input');
+        if (input) input.focus();
+      });
+    }
+  })
+  .catch(function() { showTokenForm(); });
+
+// NEAR wallet authentication via near-connect.
+async function authenticateWithNear() {
+  var nearBtn = document.getElementById('auth-near-btn');
+  var errEl = document.getElementById('auth-error');
+  if (nearBtn) { nearBtn.disabled = true; nearBtn.textContent = I18n.t('auth.connectingWallet'); }
+  if (errEl) errEl.textContent = '';
+
+  try {
+    // 1. Get challenge nonce from the server.
+    var challengeResp = await fetch('/auth/near/challenge', { credentials: 'include' });
+    if (!challengeResp.ok) throw new Error('Failed to get challenge');
+    var challenge = await challengeResp.json();
+
+    // 2. Load near-connect dynamically if not already loaded.
+    if (!window._nearConnector) {
+      var mod = await import('https://esm.sh/@hot-labs/near-connect@0.11');
+      var network = window._nearNetwork || 'mainnet';
+      window._nearConnector = new mod.NearConnector({ network: network });
+    }
+    var connector = window._nearConnector;
+
+    // 3. Connect wallet and request signature.
+    if (nearBtn) nearBtn.textContent = I18n.t('auth.signWithWallet');
+    var wallet = await connector.connect();
+    var accounts = await wallet.getAccounts();
+    if (!accounts || accounts.length === 0) throw new Error('No NEAR account found');
+
+    var accountId = accounts[0].accountId;
+
+    // Convert hex nonce to Uint8Array for signMessage.
+    var nonceBytes = new Uint8Array(challenge.nonce.match(/.{2}/g).map(function(b) { return parseInt(b, 16); }));
+
+    var signed = await wallet.signMessage({
+      message: challenge.message,
+      recipient: challenge.recipient || 'ironclaw',
+      nonce: nonceBytes,
+    });
+
+    // 4. Send signature to server for verification.
+    if (nearBtn) nearBtn.textContent = I18n.t('auth.verifying');
+    var verifyResp = await fetch('/auth/near/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        account_id: accountId,
+        public_key: signed.publicKey,
+        signature: signed.signature,
+        nonce: challenge.nonce,
+      }),
+    });
+
+    if (!verifyResp.ok) {
+      var errText = await verifyResp.text();
+      throw new Error(errText || 'Verification failed');
+    }
+
+    await verifyResp.json();
+
+    // 5. Rely on the HttpOnly session cookie created by the backend.
+    token = '';
+    sessionStorage.removeItem('ironclaw_token');
+    initApp();
+  } catch (err) {
+    if (errEl) errEl.textContent = err.message || 'NEAR wallet login failed';
+    if (nearBtn) { nearBtn.disabled = false; nearBtn.textContent = I18n.t('auth.social.near'); }
+  }
+}
 
 // Note: main event listener registration is at the bottom of this file (search
 // "Event Listener Registration"). Do NOT add duplicate listeners here.
@@ -385,19 +564,45 @@ function updateRestartButtonVisibility() {
 
 // --- SSE ---
 
-function connectSSE() {
+function rememberSseEventId(event) {
+  if (!event || !event.lastEventId) return;
+  _lastSseEventId = event.lastEventId;
+  window.__e2e = window.__e2e || {};
+  window.__e2e.lastSseEventId = event.lastEventId;
+}
+
+function connectSSE(lastEventIdOverride) {
   if (eventSource) eventSource.close();
 
   // In OIDC mode the reverse proxy provides auth; no query token needed.
-  const chatSseUrl = (token && !oidcProxyAuth)
+  let chatSseUrl = (token && !oidcProxyAuth)
     ? '/api/chat/events?token=' + encodeURIComponent(token)
     : '/api/chat/events';
+  const lastEventId = lastEventIdOverride || _lastSseEventId;
+  if (lastEventId) {
+    chatSseUrl += (chatSseUrl.includes('?') ? '&' : '?')
+      + 'last_event_id=' + encodeURIComponent(lastEventId);
+  }
   eventSource = new EventSource(chatSseUrl);
+
+  const addTrackedEventListener = (eventType, handler) => {
+    eventSource.addEventListener(eventType, (event) => {
+      rememberSseEventId(event);
+      handler(event);
+    });
+  };
 
   eventSource.onopen = () => {
     document.getElementById('sse-dot').classList.remove('disconnected');
-    document.getElementById('sse-status').textContent = I18n.t('status.connected');
+    var statusEl = document.getElementById('sse-status');
+    if (statusEl) statusEl.textContent = I18n.t('status.connected');
     _reconnectAttempts = 0;
+    // Clear stale turn-tracking state from before the disconnect
+    _turnResponseReceived = false;
+    if (_doneWithoutResponseTimer) {
+      clearTimeout(_doneWithoutResponseTimer);
+      _doneWithoutResponseTimer = null;
+    }
 
     // Dismiss connection-lost banner and show reconnected flash
     if (_connectionLostTimer) {
@@ -407,7 +612,7 @@ function connectSSE() {
     const lostBanner = document.getElementById('connection-banner');
     if (lostBanner) {
       const wasDisconnectedLong = _connectionLostAt && (Date.now() - _connectionLostAt > 10000);
-      lostBanner.textContent = 'Reconnected';
+      lostBanner.textContent = I18n.t('connection.reconnected');
       lostBanner.className = 'connection-banner connection-banner-success';
       setTimeout(() => { lostBanner.remove(); }, 2000);
       _connectionLostAt = null;
@@ -438,12 +643,13 @@ function connectSSE() {
   eventSource.onerror = () => {
     _reconnectAttempts++;
     document.getElementById('sse-dot').classList.add('disconnected');
-    document.getElementById('sse-status').textContent = I18n.t('status.reconnecting');
+    var statusEl2 = document.getElementById('sse-status');
+    if (statusEl2) statusEl2.textContent = I18n.t('status.reconnecting');
 
     // Update existing banner with attempt count
     const existingBanner = document.getElementById('connection-banner');
     if (existingBanner && existingBanner.classList.contains('connection-banner-warning')) {
-      existingBanner.textContent = 'Connection lost. Reconnecting... (attempt ' + _reconnectAttempts + ')';
+      existingBanner.textContent = I18n.t('connection.reconnecting', { count: _reconnectAttempts });
     }
 
     // Start connection-lost banner timer (3s delay)
@@ -454,13 +660,13 @@ function connectSSE() {
         // Only show if still disconnected
         const dot = document.getElementById('sse-dot');
         if (dot?.classList.contains('disconnected')) {
-          showConnectionBanner('Connection lost. Reconnecting... (attempt ' + _reconnectAttempts + ')', 'warning');
+          showConnectionBanner(I18n.t('connection.reconnecting', { count: _reconnectAttempts }), 'warning');
         }
       }, 3000);
     }
   };
 
-  eventSource.addEventListener('response', (e) => {
+  addTrackedEventListener('response', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) {
       if (data.thread_id) {
@@ -482,6 +688,11 @@ function connectSSE() {
     const streamingMsg = document.querySelector('.message.assistant[data-streaming="true"]');
     if (streamingMsg) streamingMsg.removeAttribute('data-streaming');
 
+    _turnResponseReceived = true;
+    if (_doneWithoutResponseTimer) {
+      clearTimeout(_doneWithoutResponseTimer);
+      _doneWithoutResponseTimer = null;
+    }
     finalizeActivityGroup();
     addMessage('assistant', data.content);
     enableChatInput();
@@ -494,7 +705,7 @@ function connectSSE() {
     }
   });
 
-  eventSource.addEventListener('thinking', (e) => {
+  addTrackedEventListener('thinking', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) {
       if (data.thread_id) debouncedLoadThreads();
@@ -504,7 +715,7 @@ function connectSSE() {
     showActivityThinking(data.message);
   });
 
-  eventSource.addEventListener('suggestions', (e) => {
+  addTrackedEventListener('suggestions', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     if (data.suggestions && data.suggestions.length > 0) {
@@ -512,13 +723,13 @@ function connectSSE() {
     }
   });
 
-  eventSource.addEventListener('tool_started', (e) => {
+  addTrackedEventListener('tool_started', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     addToolCard(data.name);
   });
 
-  eventSource.addEventListener('tool_completed', (e) => {
+  addTrackedEventListener('tool_completed', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     completeToolCard(data.name, data.success, data.error, data.parameters);
@@ -529,13 +740,13 @@ function connectSSE() {
     }
   });
 
-  eventSource.addEventListener('tool_result', (e) => {
+  addTrackedEventListener('tool_result', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     setToolCardOutput(data.name, data.preview);
   });
 
-  eventSource.addEventListener('stream_chunk', (e) => {
+  addTrackedEventListener('stream_chunk', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     finalizeActivityGroup();
@@ -548,6 +759,10 @@ function connectSSE() {
       lastAssistant = container.querySelector('.message.assistant:last-of-type');
     }
     if (lastAssistant) lastAssistant.setAttribute('data-streaming', 'true');
+
+    // Mark turn as having received content so the Done safety net
+    // does not trigger a spurious loadHistory() for streaming responses.
+    _turnResponseReceived = true;
 
     // Accumulate chunks and debounce rendering at 50ms intervals
     _streamBuffer += data.content;
@@ -566,7 +781,7 @@ function connectSSE() {
     }
   });
 
-  eventSource.addEventListener('status', (e) => {
+  addTrackedEventListener('status', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) {
       if (data.thread_id) debouncedLoadThreads();
@@ -579,15 +794,28 @@ function connectSSE() {
     if (data.message === 'Done' || data.message === 'Awaiting approval') {
       finalizeActivityGroup();
       enableChatInput();
+      // Safety net (#2079): if "Done" arrives but we never received a
+      // `response` event for this turn, the message may have been lost
+      // (broadcast lag, proxy buffering, brief SSE disconnect). Reload
+      // history after a short delay so the user sees the answer.
+      if (!_turnResponseReceived && data.message === 'Done') {
+        if (!_doneWithoutResponseTimer) {
+          _doneWithoutResponseTimer = setTimeout(() => {
+            _doneWithoutResponseTimer = null;
+            if (currentThreadId) loadHistory();
+          }, DONE_WITHOUT_RESPONSE_TIMEOUT_MS);
+        }
+      }
+      _turnResponseReceived = false;
     }
   });
 
-  eventSource.addEventListener('job_started', (e) => {
+  addTrackedEventListener('job_started', (e) => {
     const data = JSON.parse(e.data);
     showJobCard(data);
   });
 
-  eventSource.addEventListener('approval_needed', (e) => {
+  addTrackedEventListener('approval_needed', (e) => {
     const data = JSON.parse(e.data);
     const hasThread = !!data.thread_id;
     const forCurrentThread = !hasThread || isCurrentThread(data.thread_id);
@@ -604,26 +832,46 @@ function connectSSE() {
     if (currentTab === 'settings') refreshCurrentSettingsTab();
   });
 
-  eventSource.addEventListener('auth_required', (e) => {
+  addTrackedEventListener('auth_required', (e) => {
     handleAuthRequired(JSON.parse(e.data));
   });
 
-  eventSource.addEventListener('auth_completed', (e) => {
+  addTrackedEventListener('auth_completed', (e) => {
     const data = JSON.parse(e.data);
     handleAuthCompleted(data);
   });
 
-  eventSource.addEventListener('extension_status', (e) => {
+  addTrackedEventListener('pairing_required', (e) => {
+    const data = JSON.parse(e.data);
+    handlePairingRequired(data);
+  });
+
+  addTrackedEventListener('pairing_completed', (e) => {
+    const data = JSON.parse(e.data);
+    handlePairingCompleted(data);
+  });
+
+  addTrackedEventListener('gate_required', (e) => {
+    const data = JSON.parse(e.data);
+    handleGateRequired(data);
+  });
+
+  addTrackedEventListener('gate_resolved', (e) => {
+    const data = JSON.parse(e.data);
+    handleGateResolved(data);
+  });
+
+  addTrackedEventListener('extension_status', (e) => {
     if (currentTab === 'settings') refreshCurrentSettingsTab();
   });
 
-  eventSource.addEventListener('image_generated', (e) => {
+  addTrackedEventListener('image_generated', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     addGeneratedImage(data.data_url, data.path);
   });
 
-  eventSource.addEventListener('error', (e) => {
+  addTrackedEventListener('error', (e) => {
     if (e.data) {
       const data = JSON.parse(e.data);
       if (!isCurrentThread(data.thread_id)) return;
@@ -633,29 +881,13 @@ function connectSSE() {
     }
   });
 
-  eventSource.addEventListener('turn_cost', (e) => {
-    const event = JSON.parse(e.data);
-    if (!isCurrentThread(event.thread_id)) return;
-    // Add cost badge below last assistant message
-    const messages = document.querySelectorAll('.message.assistant');
-    const lastMsg = messages[messages.length - 1];
-    const tokens = (event.input_tokens || 0) + (event.output_tokens || 0);
-    if (lastMsg && tokens > 0) {
-      const badge = document.createElement('div');
-      badge.className = 'turn-cost-badge';
-      const cost = event.cost_usd ? ' \u00b7 ' + event.cost_usd : '';
-      badge.textContent = tokens.toLocaleString() + ' tokens' + cost;
-      lastMsg.appendChild(badge);
-    }
-  });
-
   // Job event listeners (activity stream for all sandbox jobs)
   const jobEventTypes = [
     'job_message', 'job_tool_use', 'job_tool_result',
     'job_status', 'job_result'
   ];
   for (const evtType of jobEventTypes) {
-    eventSource.addEventListener(evtType, (e) => {
+    addTrackedEventListener(evtType, (e) => {
       const data = JSON.parse(e.data);
       const jobId = data.job_id;
       if (!jobId) return;
@@ -677,6 +909,13 @@ function connectSSE() {
       }
     });
   }
+
+  // Plan progress checklist
+  addTrackedEventListener('plan_update', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.thread_id && !isCurrentThread(data.thread_id)) return;
+    renderPlanChecklist(data);
+  });
 }
 
 // Check if an SSE event belongs to the currently viewed thread.
@@ -741,9 +980,14 @@ function clearSuggestionChips() {
 function sendMessage() {
   clearSuggestionChips();
   removeWelcomeCard();
+  _turnResponseReceived = false;
+  if (_doneWithoutResponseTimer) {
+    clearTimeout(_doneWithoutResponseTimer);
+    _doneWithoutResponseTimer = null;
+  }
   const input = document.getElementById('chat-input');
   if (authFlowPending) {
-    showToast('Complete the auth step before sending chat messages.', 'info');
+    showToast(I18n.t('chat.authRequiredBeforeSend'), 'info');
     const tokenField = document.querySelector('.auth-card .auth-token-input input');
     if (tokenField) tokenField.focus();
     return;
@@ -755,6 +999,32 @@ function sendMessage() {
   if (_sendCooldown) return;
   const content = input.value.trim();
   if (!content && stagedImages.length === 0) return;
+
+  // Intercept approval keywords when an unresolved approval card is pending.
+  // Find the most recent unresolved card (resolved cards linger 1.5s before removal).
+  const approvalCards = Array.from(document.querySelectorAll('.approval-card'));
+  const approvalCard = approvalCards.reverse().find(card => !card.querySelector('.approval-resolved'));
+  if (approvalCard && content) {
+    const lower = content.toLowerCase();
+    let action = null;
+    if (['yes', 'y', 'approve', 'ok', '/approve', '/yes', '/y'].includes(lower)) {
+      action = 'approve';
+    } else if (['always', 'a', 'yes always', 'approve always', '/always', '/a'].includes(lower)) {
+      action = 'always';
+    } else if (['no', 'n', 'deny', 'reject', 'cancel', '/deny', '/no', '/n'].includes(lower)) {
+      action = 'deny';
+    }
+    if (action) {
+      input.value = '';
+      autoResizeTextarea(input);
+      input.focus();
+      const requestId = approvalCard.getAttribute('data-request-id');
+      if (requestId) {
+        sendApprovalAction(requestId, action);
+      }
+      return;
+    }
+  }
 
   const userMsg = addMessage('user', content || '(images attached)');
   input.value = '';
@@ -774,7 +1044,7 @@ function sendMessage() {
   }).catch((err) => {
     // Handle rate limiting (429)
     if (err.status === 429) {
-      showToast('Rate limited. Please wait.', 'error');
+      showToast(I18n.t('chat.rateLimited'), 'error');
       _sendCooldown = true;
       const sendBtn = document.getElementById('send-btn');
       if (sendBtn) sendBtn.disabled = true;
@@ -790,7 +1060,7 @@ function sendMessage() {
       const retryLink = document.createElement('a');
       retryLink.className = 'retry-link';
       retryLink.href = '#';
-      retryLink.textContent = 'Retry';
+      retryLink.textContent = I18n.t('common.retry');
       retryLink.addEventListener('click', (e) => {
         e.preventDefault();
         if (userMsg.parentNode) userMsg.parentNode.removeChild(userMsg);
@@ -847,11 +1117,11 @@ function handleImageFiles(files) {
   Array.from(files).forEach(file => {
     if (!file.type.startsWith('image/')) return;
     if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      alert(`Image "${file.name}" exceeds 5 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB)`);
+      alert(I18n.t('chat.imageTooBig', { name: file.name, size: (file.size / 1024 / 1024).toFixed(1) }));
       return;
     }
     if (stagedImages.length >= MAX_STAGED_IMAGES) {
-      alert(`Maximum ${MAX_STAGED_IMAGES} images allowed per message`);
+      alert(I18n.t('chat.maxImages', { n: MAX_STAGED_IMAGES }));
       return;
     }
     const reader = new FileReader();
@@ -991,9 +1261,14 @@ function filterSlashCommands(value) {
 }
 
 function sendApprovalAction(requestId, action) {
-  apiFetch('/api/chat/approval', {
+  apiFetch('/api/chat/gate/resolve', {
     method: 'POST',
-    body: { request_id: requestId, action: action, thread_id: currentThreadId },
+    body: {
+      request_id: requestId,
+      thread_id: currentThreadId,
+      resolution: action === 'deny' ? 'denied' : 'approved',
+      always: action === 'always',
+    },
   }).catch((err) => {
     addMessage('system', 'Failed to send approval: ' + err.message);
   });
@@ -1008,7 +1283,7 @@ function sendApprovalAction(requestId, action) {
     const actions = card.querySelector('.approval-actions');
     const label = document.createElement('span');
     label.className = 'approval-resolved';
-    const labelText = action === 'approve' ? 'Approved' : action === 'always' ? 'Always approved' : 'Denied';
+    const labelText = action === 'approve' ? I18n.t('approval.approved') : action === 'always' ? I18n.t('approval.alwaysApproved') : I18n.t('approval.denied');
     label.textContent = labelText;
     actions.appendChild(label);
     // Remove the card after showing the confirmation briefly
@@ -1069,11 +1344,11 @@ function copyMessage(btn) {
     || message.textContent
     || '';
   navigator.clipboard.writeText(text).then(() => {
-    btn.textContent = 'Copied';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+    btn.textContent = I18n.t('message.copied');
+    setTimeout(() => { btn.textContent = I18n.t('message.copy'); }, 1200);
   }).catch(() => {
-    btn.textContent = 'Failed';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+    btn.textContent = I18n.t('common.copyFailed');
+    setTimeout(() => { btn.textContent = I18n.t('message.copy'); }, 1200);
   });
 }
 
@@ -1391,8 +1666,7 @@ function humanizeToolName(rawName) {
 }
 
 function shouldShowChannelConnectedMessage(extensionName, success) {
-  if (!success || !extensionName) return false;
-  return String(extensionName).toLowerCase().includes('telegram');
+  return false;
 }
 
 function showApproval(data) {
@@ -1467,6 +1741,94 @@ function showApproval(data) {
   container.scrollTop = container.scrollHeight;
 }
 
+// --- Plan Checklist ---
+
+function renderPlanChecklist(data) {
+  const chatContainer = document.getElementById('chat-messages');
+  const planId = data.plan_id;
+
+  // Find or create the plan container
+  let container = chatContainer.querySelector('.plan-container[data-plan-id="' + CSS.escape(planId) + '"]');
+  if (!container) {
+    container = document.createElement('div');
+    container.className = 'plan-container';
+    container.setAttribute('data-plan-id', planId);
+    chatContainer.appendChild(container);
+  }
+
+  // Clear and rebuild
+  container.innerHTML = '';
+
+  // Header
+  const header = document.createElement('div');
+  header.className = 'plan-header';
+
+  const title = document.createElement('span');
+  title.className = 'plan-title';
+  title.textContent = data.title || planId;
+  header.appendChild(title);
+
+  const badge = document.createElement('span');
+  badge.className = 'plan-status-badge plan-status-' + (data.status || 'draft');
+  badge.textContent = data.status || 'draft';
+  header.appendChild(badge);
+
+  container.appendChild(header);
+
+  // Steps
+  if (data.steps && data.steps.length > 0) {
+    const stepsList = document.createElement('div');
+    stepsList.className = 'plan-steps';
+
+    let completed = 0;
+    for (const step of data.steps) {
+      const stepEl = document.createElement('div');
+      stepEl.className = 'plan-step';
+      stepEl.setAttribute('data-status', step.status || 'pending');
+
+      const icon = document.createElement('span');
+      icon.className = 'plan-step-icon';
+      if (step.status === 'completed') {
+        icon.textContent = '\u2713'; // checkmark
+        completed++;
+      } else if (step.status === 'failed') {
+        icon.textContent = '\u2717'; // X
+      } else if (step.status === 'in_progress') {
+        icon.innerHTML = '<span class="plan-spinner"></span>';
+      } else {
+        icon.textContent = '\u25CB'; // circle
+      }
+      stepEl.appendChild(icon);
+
+      const text = document.createElement('span');
+      text.className = 'plan-step-text';
+      text.textContent = step.title;
+      stepEl.appendChild(text);
+
+      if (step.result) {
+        const result = document.createElement('span');
+        result.className = 'plan-step-result';
+        result.textContent = step.result;
+        stepEl.appendChild(result);
+      }
+
+      stepsList.appendChild(stepEl);
+    }
+    container.appendChild(stepsList);
+
+    // Summary
+    const summary = document.createElement('div');
+    summary.className = 'plan-summary';
+    summary.textContent = completed + ' of ' + data.steps.length + ' steps completed';
+    if (data.mission_id) {
+      summary.textContent += ' \u00b7 Mission: ' + data.mission_id.substring(0, 8);
+    }
+    container.appendChild(summary);
+  }
+
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
 function showJobCard(data) {
   const container = document.getElementById('chat-messages');
   const card = document.createElement('div');
@@ -1506,6 +1868,7 @@ function showJobCard(data) {
     browseBtn.className = 'job-card-browse';
     browseBtn.href = data.browse_url;
     browseBtn.target = '_blank';
+    browseBtn.rel = 'noopener noreferrer';
     browseBtn.textContent = I18n.t('jobs.browse');
     card.appendChild(browseBtn);
   }
@@ -1516,24 +1879,120 @@ function showJobCard(data) {
 
 // --- Auth card ---
 
-function handleAuthRequired(data) {
+async function handleAuthRequired(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) {
+    unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
+    debouncedLoadThreads();
+    return;
+  }
+  if (data.extension_name && getConfigureOverlay(data.extension_name)) {
+    return;
+  }
+  const existingCard = data.extension_name ? getAuthCard(data.extension_name) : getAuthCard();
+  if (existingCard && !data.request_id) {
+    const existingRequestId = existingCard.getAttribute('data-request-id');
+    const existingThreadId = existingCard.getAttribute('data-thread-id');
+    const incomingThreadId = data.thread_id || currentThreadId || null;
+    if (existingRequestId && (!existingThreadId || !incomingThreadId || existingThreadId === incomingThreadId)) {
+      return;
+    }
+  }
+  if (!data.request_id) {
+    const threadId = data.thread_id || currentThreadId || null;
+    if (threadId) {
+      try {
+        const history = await apiFetch('/api/chat/history?thread_id=' + encodeURIComponent(threadId));
+        const pendingGate = history && history.pending_gate;
+        if (pendingGate && pendingGate.request_id) {
+          const resumeKind = parseGateResumeKind(pendingGate.resume_kind);
+          if (resumeKind && resumeKind.type === 'authentication') {
+            handleGateRequired({
+              ...pendingGate,
+              thread_id: pendingGate.thread_id || threadId,
+            });
+            return;
+          }
+        }
+      } catch (_) {
+        // Fall through to the legacy card when pending-gate hydration fails.
+      }
+    }
+  }
+  setAuthFlowPending(true, data.instructions);
   if (data.auth_url) {
-    setAuthFlowPending(true, data.instructions);
-    // OAuth flow: show the global auth prompt with an OAuth button + optional token paste field.
+    // Token paste flow (with optional OAuth button): show the global auth
+    // prompt card. This handles both OAuth credentials (auth_url present)
+    // and skill-based credentials (instructions present, no auth_url).
     showAuthCard(data);
   } else {
     if (getConfigureOverlay(data.extension_name)) return;
-    setAuthFlowPending(true, data.instructions);
-    // Setup flow: fetch the extension's credential schema and show the multi-field
-    // configure modal (the same UI used by the Extensions tab "Setup" button).
-    showConfigureModal(data.extension_name);
+    showSetupCardForExtension(data);
+  }
+}
+
+function parseGateResumeKind(resumeKind) {
+  if (!resumeKind || typeof resumeKind !== 'object') return null;
+  if (resumeKind.Approval) return { type: 'approval', ...resumeKind.Approval };
+  if (resumeKind.Authentication) return { type: 'authentication', ...resumeKind.Authentication };
+  if (resumeKind.External) return { type: 'external', ...resumeKind.External };
+  return null;
+}
+
+function handleGateRequired(data) {
+  const hasThread = !!data.thread_id;
+  const forCurrentThread = !hasThread || isCurrentThread(data.thread_id);
+  const resume = parseGateResumeKind(data.resume_kind);
+  if (!forCurrentThread) {
+    unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
+    debouncedLoadThreads();
+    return;
+  }
+  if (resume && resume.type === 'authentication') {
+    handleAuthRequired({
+      extension_name: resume.credential_name,
+      instructions: resume.instructions,
+      auth_url: resume.auth_url || null,
+      request_id: data.request_id,
+      thread_id: data.thread_id || currentThreadId,
+    });
+    return;
+  }
+  showApproval({
+    request_id: data.request_id,
+    tool_name: data.tool_name,
+    description: data.description,
+    parameters: data.parameters,
+    allow_always: !(resume && resume.type === 'approval' && resume.allow_always === false),
+    thread_id: data.thread_id || currentThreadId,
+  });
+}
+
+function handleGateResolved(data) {
+  const hasThread = !!data.thread_id;
+  if (hasThread && !isCurrentThread(data.thread_id)) {
+    debouncedLoadThreads();
+    return;
+  }
+  document.querySelectorAll('.approval-card[data-request-id="' + CSS.escape(data.request_id) + '"]').forEach((el) => el.remove());
+  if (
+    data.resolution === 'credential_provided'
+    || data.resolution === 'cancelled'
+    || data.resolution === 'external_callback'
+  ) {
+    removeAuthCard();
+    enableChatInput();
   }
 }
 
 function handleAuthCompleted(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) {
+    debouncedLoadThreads();
+    return;
+  }
   showToast(data.message, data.success ? 'success' : 'error');
   // Dismiss only the matching extension's UI so stale prompts are cleared.
   removeAuthCard(data.extension_name);
+  removeSetupCard(data.extension_name);
   closeConfigureModal(data.extension_name);
   if (!data.success) {
     setAuthFlowPending(false);
@@ -1547,6 +2006,29 @@ function handleAuthCompleted(data) {
   }
   if (currentTab === 'settings') refreshCurrentSettingsTab();
   enableChatInput();
+}
+
+function handlePairingRequired(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) {
+    unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
+    debouncedLoadThreads();
+    return;
+  }
+  showPairingCard(data);
+}
+
+function handlePairingCompleted(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) {
+    debouncedLoadThreads();
+    return;
+  }
+  removePairingCard(data.channel);
+  const recentApprovalAt = _recentLocalPairingApprovals.get(data.channel);
+  if (!recentApprovalAt || Date.now() - recentApprovalAt > 5000) {
+    showToast(data.message, data.success ? 'success' : 'error');
+  }
+  _recentLocalPairingApprovals.delete(data.channel);
+  if (currentTab === 'settings') refreshCurrentSettingsTab();
 }
 
 function queryByDataAttribute(selector, attributeName, attributeValue) {
@@ -1573,11 +2055,206 @@ function getAuthCard(extensionName) {
   return queryByDataAttribute('.auth-card', 'data-extension-name', extensionName);
 }
 
+function getPairingCard(channel) {
+  return queryByDataAttribute('.pairing-card', 'data-channel', channel);
+}
+
 function getConfigureOverlay(extensionName) {
   return queryByDataAttribute('.configure-overlay', 'data-extension-name', extensionName);
 }
 
+function removeSetupCard(extensionName) {
+  removeAuthCard(extensionName);
+}
+
+function buildSetupFields(form, extensionName, secrets, submitFn) {
+  const fields = [];
+  (secrets || []).forEach((secret) => {
+    const field = document.createElement('label');
+    field.className = 'setup-field';
+
+    const label = document.createElement('span');
+    label.className = 'setup-label';
+    label.textContent = secret.prompt;
+    field.appendChild(label);
+
+    const inputRow = document.createElement('div');
+    inputRow.className = 'setup-input-row';
+
+    const input = document.createElement('input');
+    input.className = 'setup-input';
+    input.type = 'password';
+    input.name = secret.name;
+    input.placeholder = secret.provided ? I18n.t('config.alreadySet') : secret.prompt;
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitFn();
+    });
+    inputRow.appendChild(input);
+    field.appendChild(inputRow);
+    form.appendChild(field);
+    fields.push({ name: secret.name, input });
+  });
+  return fields;
+}
+
+function showSetupCardForExtension(data) {
+  apiFetch('/api/extensions/' + encodeURIComponent(data.extension_name) + '/setup')
+    .then((setup) => {
+      const secrets = Array.isArray(setup.secrets) ? setup.secrets : [];
+      const fields = Array.isArray(setup.fields) ? setup.fields : [];
+      if (secrets.length === 0 && fields.length === 0) {
+        showAuthCard(data);
+        return;
+      }
+      showSetupCard({
+        extension_name: data.extension_name,
+        onboarding: setup.onboarding || null,
+        secrets,
+      });
+    })
+    .catch(() => {
+      showAuthCard(data);
+    });
+}
+
+function showSetupCard(data) {
+  const existing = getAuthOverlay();
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'auth-overlay';
+  overlay.setAttribute('data-extension-name', data.extension_name);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) cancelAuth(data.extension_name);
+  });
+
+  const card = document.createElement('div');
+  card.className = 'auth-card auth-modal setup-card';
+  card.setAttribute('data-extension-name', data.extension_name);
+
+  const onboarding = data.onboarding || {};
+
+  const header = document.createElement('div');
+  header.className = 'auth-header';
+  header.textContent = onboarding.credential_title || ('Configure credentials for ' + data.extension_name);
+  card.appendChild(header);
+
+  if (onboarding.credential_instructions) {
+    const instr = document.createElement('div');
+    instr.className = 'auth-instructions';
+    instr.textContent = onboarding.credential_instructions;
+    card.appendChild(instr);
+  }
+
+  if (onboarding.setup_url) {
+    // Strict HTTPS validation via shared helper — defends against
+    // `javascript:`/`data:` URLs in extension/registry metadata.
+    const parsedSetupUrl = parseHttpsExternalUrl(onboarding.setup_url, 'setup');
+    if (parsedSetupUrl) {
+      const links = document.createElement('div');
+      links.className = 'auth-links';
+      const setupLink = document.createElement('a');
+      setupLink.href = parsedSetupUrl.href;
+      setupLink.target = '_blank';
+      setupLink.rel = 'noopener noreferrer';
+      setupLink.textContent = I18n.t('authRequired.getToken');
+      links.appendChild(setupLink);
+      card.appendChild(links);
+    }
+  }
+
+  const form = document.createElement('div');
+  form.className = 'setup-form';
+  card.appendChild(form);
+
+  let fields = [];
+  const submit = () => submitSetupCard(data.extension_name, fields, card);
+  fields = buildSetupFields(form, data.extension_name, data.secrets || [], submit);
+
+  if (onboarding.credential_next_step) {
+    const nextStep = document.createElement('div');
+    nextStep.className = 'setup-next-step';
+    nextStep.textContent = onboarding.credential_next_step;
+    card.appendChild(nextStep);
+  }
+
+  const errorEl = document.createElement('div');
+  errorEl.className = 'auth-error';
+  errorEl.style.display = 'none';
+  card.appendChild(errorEl);
+
+  const actions = document.createElement('div');
+  actions.className = 'auth-actions';
+
+  const submitBtn = document.createElement('button');
+  submitBtn.className = 'auth-submit';
+  submitBtn.textContent = I18n.t('config.save');
+  submitBtn.addEventListener('click', submit);
+  actions.appendChild(submitBtn);
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'auth-cancel';
+  cancelBtn.textContent = I18n.t('btn.cancel');
+  cancelBtn.addEventListener('click', () => cancelAuth(data.extension_name));
+  actions.appendChild(cancelBtn);
+
+  card.appendChild(actions);
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+  if (fields.length > 0) fields[0].input.focus();
+}
+
+function showSetupCardError(extensionName, message) {
+  const card = getAuthCard(extensionName);
+  if (!card) return;
+  card.querySelectorAll('button').forEach((btn) => {
+    btn.disabled = false;
+  });
+  const errorEl = card.querySelector('.auth-error');
+  if (errorEl) {
+    errorEl.textContent = message;
+    errorEl.style.display = 'block';
+  }
+}
+
+function submitSetupCard(extensionName, fields, cardEl) {
+  const secrets = {};
+  (fields || []).forEach((field) => {
+    const value = (field.input.value || '').trim();
+    if (value) secrets[field.name] = value;
+  });
+
+  const card = cardEl || getAuthCard(extensionName);
+  if (card) {
+    card.querySelectorAll('button').forEach((btn) => {
+      btn.disabled = true;
+    });
+  }
+
+  apiFetch('/api/extensions/' + encodeURIComponent(extensionName) + '/setup', {
+    method: 'POST',
+    body: { secrets, fields: {} },
+  }).then((result) => {
+    if (!result.success) {
+      showSetupCardError(extensionName, result.message || 'Configuration failed.');
+      return;
+    }
+    removeSetupCard(extensionName);
+    if (result.onboarding_state === 'pairing_required') {
+      showPairingCard({
+        channel: extensionName,
+        instructions: result.onboarding && result.onboarding.pairing_instructions,
+        onboarding: result.onboarding || null,
+      });
+    }
+    refreshCurrentSettingsTab();
+  }).catch((err) => {
+    showSetupCardError(extensionName, 'Configuration failed: ' + err.message);
+  });
+}
+
 function showAuthCard(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) return;
   // Keep a single global auth prompt so the experience is consistent across tabs.
   const existing = getAuthOverlay();
   if (existing) existing.remove();
@@ -1592,6 +2269,12 @@ function showAuthCard(data) {
   const card = document.createElement('div');
   card.className = 'auth-card auth-modal';
   card.setAttribute('data-extension-name', data.extension_name);
+  if (data.thread_id) {
+    card.setAttribute('data-thread-id', data.thread_id);
+  }
+  if (data.request_id) {
+    card.setAttribute('data-request-id', data.request_id);
+  }
 
   const header = document.createElement('div');
   header.className = 'auth-header';
@@ -1609,21 +2292,30 @@ function showAuthCard(data) {
   links.className = 'auth-links';
 
   if (data.auth_url) {
-    const oauthBtn = document.createElement('button');
-    oauthBtn.className = 'auth-oauth';
-    oauthBtn.textContent = I18n.t('authRequired.authenticateWith', {name: data.extension_name});
-    oauthBtn.addEventListener('click', () => {
-      openOAuthUrl(data.auth_url);
-    });
-    links.appendChild(oauthBtn);
+    const parsedAuthUrl = parseHttpsOAuthUrl(data.auth_url);
+    if (parsedAuthUrl) {
+      const oauthLink = document.createElement('a');
+      oauthLink.className = 'auth-oauth';
+      oauthLink.href = parsedAuthUrl.href;
+      oauthLink.target = '_blank';
+      // Match the other external links: include `noreferrer` so the
+      // OAuth provider does not see the in-app Referer header.
+      oauthLink.rel = 'noopener noreferrer';
+      oauthLink.textContent = I18n.t('authRequired.authenticateWith', {name: data.extension_name});
+      links.appendChild(oauthLink);
+    }
   }
 
   if (data.setup_url) {
-    const setupLink = document.createElement('a');
-    setupLink.href = data.setup_url;
-    setupLink.target = '_blank';
-    setupLink.textContent = I18n.t('authRequired.getToken');
-    links.appendChild(setupLink);
+    const parsedSetupUrl = parseHttpsExternalUrl(data.setup_url, 'setup');
+    if (parsedSetupUrl) {
+      const setupLink = document.createElement('a');
+      setupLink.href = parsedSetupUrl.href;
+      setupLink.target = '_blank';
+      setupLink.rel = 'noopener noreferrer';
+      setupLink.textContent = I18n.t('authRequired.getToken');
+      links.appendChild(setupLink);
+    }
   }
 
   if (links.children.length > 0) {
@@ -1637,7 +2329,6 @@ function showAuthCard(data) {
   const tokenInput = document.createElement('input');
   tokenInput.type = 'password';
   tokenInput.placeholder = data.instructions
-    || I18n.t('auth.extensionTokenPlaceholder')
     || I18n.t('auth.tokenPlaceholder');
   tokenInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value);
@@ -1688,20 +2379,155 @@ function removeAuthCard(extensionName) {
   }
 }
 
+function showPairingCard(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) return;
+  removePairingCard(data.channel);
+
+  const container = document.getElementById('chat-messages');
+  const card = document.createElement('div');
+  card.className = 'auth-card pairing-card';
+  card.setAttribute('data-channel', data.channel);
+  if (data.thread_id) {
+    card.setAttribute('data-thread-id', data.thread_id);
+  }
+
+  const header = document.createElement('div');
+  header.className = 'auth-header';
+  header.textContent = (data.onboarding && data.onboarding.pairing_title) || ('Claim ownership for ' + data.channel);
+  card.appendChild(header);
+
+  const instr = document.createElement('div');
+  instr.className = 'auth-instructions';
+  instr.textContent = (data.onboarding && data.onboarding.pairing_instructions)
+    || data.instructions
+    || ('Paste the pairing code from ' + data.channel + '.');
+  card.appendChild(instr);
+
+  if (data.onboarding && data.onboarding.restart_instructions) {
+    const restart = document.createElement('div');
+    restart.className = 'setup-next-step pairing-restart';
+    restart.textContent = data.onboarding.restart_instructions;
+    card.appendChild(restart);
+  }
+
+  const inputRow = document.createElement('div');
+  inputRow.className = 'auth-token-input';
+
+  const codeInput = document.createElement('input');
+  codeInput.type = 'text';
+  codeInput.placeholder = I18n.t('extensions.pairingCodePlaceholder');
+  codeInput.autocomplete = 'off';
+  codeInput.spellcheck = false;
+  codeInput.autocapitalize = 'characters';
+  codeInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitPairingCode(data.channel, codeInput.value, card);
+  });
+  inputRow.appendChild(codeInput);
+  card.appendChild(inputRow);
+
+  const errorEl = document.createElement('div');
+  errorEl.className = 'auth-error';
+  errorEl.style.display = 'none';
+  card.appendChild(errorEl);
+
+  const actions = document.createElement('div');
+  actions.className = 'auth-actions';
+
+  const submitBtn = document.createElement('button');
+  submitBtn.className = 'auth-submit pairing-submit';
+  submitBtn.textContent = I18n.t('approval.approve');
+  submitBtn.addEventListener('click', () => submitPairingCode(data.channel, codeInput.value, card));
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'auth-cancel pairing-cancel';
+  cancelBtn.textContent = I18n.t('btn.cancel');
+  cancelBtn.addEventListener('click', () => cancelPairingCard(data.channel, data.onboarding));
+
+  actions.appendChild(submitBtn);
+  actions.appendChild(cancelBtn);
+  card.appendChild(actions);
+
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
+  codeInput.focus();
+}
+
+function cancelPairingCard(channel, onboarding) {
+  removePairingCard(channel);
+  showToast(
+    (onboarding && onboarding.restart_instructions) || I18n.t('extensions.pairingRestartHint'),
+    'info'
+  );
+}
+
+function removePairingCard(channel) {
+  const card = getPairingCard(channel);
+  if (card) card.remove();
+}
+
+function showPairingCardError(channel, message) {
+  const card = getPairingCard(channel);
+  if (!card) return;
+  card.querySelectorAll('button').forEach((btn) => {
+    btn.disabled = false;
+  });
+  const errorEl = card.querySelector('.auth-error');
+  if (errorEl) {
+    errorEl.textContent = message;
+    errorEl.style.display = 'block';
+  }
+}
+
+function submitPairingCode(channel, codeValue, cardEl) {
+  approvePairing(channel, codeValue, {
+    skipSuccessToast: true,
+    skipRefresh: true,
+    onSuccess: function() {
+      removePairingCard(channel);
+    },
+    onError: function(message) {
+      showPairingCardError(channel, message);
+      const card = cardEl || getPairingCard(channel);
+      if (card) {
+        const input = card.querySelector('.auth-token-input input');
+        if (input) input.focus();
+      }
+    }
+  });
+}
+
 function submitAuthToken(extensionName, tokenValue) {
   if (!tokenValue || !tokenValue.trim()) return;
 
   // Disable submit button while in flight
   const card = getAuthCard(extensionName);
+  const threadId = card ? card.getAttribute('data-thread-id') : null;
   if (card) {
     const btns = card.querySelectorAll('button');
     btns.forEach((b) => { b.disabled = true; });
   }
 
-  apiFetch('/api/chat/auth-token', {
+  const isGateResolution = !!(card && card.getAttribute('data-request-id'));
+  const requestId = card ? card.getAttribute('data-request-id') : null;
+  const request = isGateResolution ? apiFetch('/api/chat/gate/resolve', {
     method: 'POST',
-    body: { extension_name: extensionName, token: tokenValue.trim() },
-  }).then((result) => {
+    body: {
+      request_id: requestId,
+      thread_id: threadId || currentThreadId || undefined,
+      resolution: 'credential_provided',
+      token: tokenValue.trim(),
+    },
+  }) : apiFetch('/api/chat/auth-token', {
+    method: 'POST',
+    body: {
+      extension_name: extensionName,
+      token: tokenValue.trim(),
+      request_id: requestId,
+      thread_id: threadId || currentThreadId || undefined,
+    },
+  });
+
+  request.then((result) => {
     if (result.success) {
       // Close immediately for responsiveness; the authoritative success UX
       // (toast + extensions refresh) still comes from auth_completed SSE.
@@ -1716,10 +2542,25 @@ function submitAuthToken(extensionName, tokenValue) {
 }
 
 function cancelAuth(extensionName) {
-  apiFetch('/api/chat/auth-cancel', {
+  const card = getAuthCard(extensionName);
+  const threadId = card ? card.getAttribute('data-thread-id') : null;
+  const requestId = card ? card.getAttribute('data-request-id') : null;
+  const request = requestId ? apiFetch('/api/chat/gate/resolve', {
     method: 'POST',
-    body: { extension_name: extensionName },
-  }).catch(() => {});
+    body: {
+      request_id: requestId,
+      thread_id: threadId || currentThreadId || undefined,
+      resolution: 'cancelled',
+    },
+  }) : apiFetch('/api/chat/auth-cancel', {
+    method: 'POST',
+    body: {
+      extension_name: extensionName,
+      request_id: requestId,
+      thread_id: threadId || currentThreadId || undefined,
+    },
+  });
+  request.catch(() => {});
   removeAuthCard(extensionName);
   setAuthFlowPending(false);
   enableChatInput();
@@ -1801,9 +2642,24 @@ function loadHistory(before) {
       if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
         showActivityThinking('Processing...');
       }
-      // Re-render pending approval card if the thread is awaiting approval
-      if (data.pending_approval) {
-        showApproval(data.pending_approval);
+      if (data.pending_gate) {
+        handleGateRequired({
+          ...data.pending_gate,
+          thread_id: data.pending_gate.thread_id || currentThreadId,
+        });
+      } else {
+        // No pending gate for this history view. Keep a global auth overlay if
+        // it belongs to a different thread; another tab/thread may still be
+        // waiting on it.
+        const overlay = getAuthOverlay();
+        if (overlay) {
+          const overlayThreadId = overlay.getAttribute('data-thread-id');
+          if (overlayThreadId && overlayThreadId !== currentThreadId) {
+            return;
+          }
+        }
+        removeAuthCard();
+        setAuthFlowPending(false);
       }
     } else {
       // Pagination: prepend older messages
@@ -1872,8 +2728,8 @@ function createMessageElement(role, content) {
     const copyBtn = document.createElement('button');
     copyBtn.className = 'message-copy-btn';
     copyBtn.type = 'button';
-    copyBtn.setAttribute('aria-label', 'Copy message');
-    copyBtn.textContent = 'Copy';
+    copyBtn.setAttribute('aria-label', I18n.t('message.copy'));
+    copyBtn.textContent = I18n.t('message.copy');
     copyBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       copyMessage(copyBtn);
@@ -1949,8 +2805,8 @@ function removeScrollSpinner() {
 function threadTitle(thread) {
   if (thread.title) return thread.title;
   const ch = thread.channel || 'gateway';
-  if (thread.thread_type === 'heartbeat') return 'Heartbeat Alerts';
-  if (thread.thread_type === 'routine') return 'Routine';
+  if (thread.thread_type === 'heartbeat') return I18n.t('thread.heartbeatAlerts');
+  if (thread.thread_type === 'routine') return I18n.t('thread.routine');
   if (ch !== 'gateway') return ch.charAt(0).toUpperCase() + ch.slice(1);
   if (thread.turn_count === 0) return 'New chat';
   return thread.id.substring(0, 8);
@@ -1995,7 +2851,7 @@ function loadThreads() {
       const labelEl = document.getElementById('assistant-label');
       if (labelEl) {
         const at = data.assistant_thread;
-        labelEl.textContent = 'Assistant';
+        labelEl.textContent = I18n.t('thread.assistant');
       }
       const meta = document.getElementById('assistant-meta');
       meta.textContent = relativeTime(data.assistant_thread.updated_at);
@@ -2067,7 +2923,7 @@ function disableChatInputReadOnly() {
   const btn = document.getElementById('send-btn');
   if (input) {
     input.disabled = true;
-    input.placeholder = 'Read-only thread (external channel)';
+    input.placeholder = I18n.t('chat.readOnlyThread');
   }
   if (btn) btn.disabled = true;
 }
@@ -2092,6 +2948,11 @@ function switchToAssistant() {
 function switchThread(threadId) {
   clearSuggestionChips();
   finalizeActivityGroup();
+  _turnResponseReceived = false;
+  if (_doneWithoutResponseTimer) {
+    clearTimeout(_doneWithoutResponseTimer);
+    _doneWithoutResponseTimer = null;
+  }
   currentThreadId = threadId;
   unreadThreads.delete(threadId);
   hasMore = false;
@@ -2108,11 +2969,13 @@ function switchThread(threadId) {
 function createNewThread() {
   apiFetch('/api/chat/thread/new', { method: 'POST' }).then((data) => {
     currentThreadId = data.id || null;
+    currentThreadIsReadOnly = false;
     document.getElementById('chat-messages').innerHTML = '';
     showWelcomeCard();
+    enableChatInput();
     loadThreads();
   }).catch((err) => {
-    showToast('Failed to create thread: ' + err.message, 'error');
+    showToast(I18n.t('chat.threadCreateFailed', { message: err.message }), 'error');
   });
 }
 
@@ -2205,19 +3068,53 @@ chatInput.addEventListener('blur', () => {
   setTimeout(hideSlashAutocomplete, 150);
 });
 
-// Infinite scroll: load older messages when scrolled near the top
+// Infinite scroll: load older messages when scrolled near the top.
+// Also toggles the scroll-to-bottom button when the user has scrolled up.
+// The handler is rAF-throttled so rapid scroll events coalesce into at most
+// one layout read per frame.
+let _scrollRafPending = false;
 document.getElementById('chat-messages').addEventListener('scroll', function () {
-  if (this.scrollTop < 100 && hasMore && !loadingOlder) {
+  const container = this;
+  if (container.scrollTop < 100 && hasMore && !loadingOlder) {
     loadingOlder = true;
     // Show spinner at top
     const spinner = document.createElement('div');
     spinner.id = 'scroll-load-spinner';
     spinner.className = 'scroll-load-spinner';
     spinner.innerHTML = '<div class="spinner"></div> Loading older messages...';
-    this.insertBefore(spinner, this.firstChild);
+    container.insertBefore(spinner, container.firstChild);
     loadHistory(oldestTimestamp);
   }
+  if (_scrollRafPending) return;
+  _scrollRafPending = true;
+  requestAnimationFrame(() => {
+    _scrollRafPending = false;
+    const btn = document.getElementById('scroll-to-bottom-btn');
+    if (!btn) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    btn.style.display = distanceFromBottom > 200 ? 'flex' : 'none';
+  });
 });
+
+document.getElementById('scroll-to-bottom-btn').addEventListener('click', () => {
+  const container = document.getElementById('chat-messages');
+  container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+});
+
+// Keep the scroll-to-bottom button anchored just above the chat input,
+// even when the textarea grows to multiple lines.
+(() => {
+  const input = document.querySelector('.chat-container .chat-input');
+  const container = document.querySelector('.chat-container');
+  if (!input || !container || typeof ResizeObserver === 'undefined') return;
+  const ro = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      const h = entry.borderBoxSize?.[0]?.blockSize ?? entry.contentRect.height;
+      container.style.setProperty('--chat-input-height', `${Math.ceil(h)}px`);
+    }
+  });
+  ro.observe(input);
+})();
 
 function autoResizeTextarea(el) {
   const prev = el.offsetHeight;
@@ -2250,8 +3147,10 @@ function switchTab(tab) {
 
   if (tab === 'memory') loadMemoryTree();
   if (tab === 'jobs') loadJobs();
+  if (tab === 'missions') loadMissions();
   if (tab === 'routines') loadRoutines();
-  if (tab === 'logs') applyLogFilters();
+  if (tab === 'logs') { connectLogSSE(); applyLogFilters(); }
+  else if (logEventSource) { logEventSource.close(); logEventSource = null; }
   if (tab === 'settings') {
     loadSettingsSubtab(currentSettingsSubtab);
   } else {
@@ -2449,11 +3348,11 @@ function saveMemoryEdit() {
     method: 'POST',
     body: { path: currentMemoryPath, content: content },
   }).then(() => {
-    showToast('Saved ' + currentMemoryPath, 'success');
+    showToast(I18n.t('memory.savedPath', { path: currentMemoryPath }), 'success');
     cancelMemoryEdit();
     readMemoryFile(currentMemoryPath);
   }).catch((err) => {
-    showToast('Save failed: ' + err.message, 'error');
+    showToast(I18n.t('memory.saveFailed', { message: err.message }), 'error');
   });
 }
 
@@ -2616,7 +3515,7 @@ function toggleLogsPause() {
 }
 
 function clearLogs() {
-  if (!confirm('Clear all logs?')) return;
+  if (!confirm(I18n.t('logs.confirmClear'))) return;
   document.getElementById('logs-output').innerHTML = '';
   logBuffer = [];
 }
@@ -2762,7 +3661,7 @@ function renderAvailableExtensionCard(entry) {
             extension_name: entry.name,
             auth_url: res.auth_url,
           });
-          showToast('Opening authentication for ' + entry.display_name, 'info');
+          showToast(I18n.t('extensions.openingAuth', { name: entry.display_name }), 'info');
           openOAuthUrl(res.auth_url);
         }
         refreshCurrentSettingsTab();
@@ -2771,11 +3670,11 @@ function renderAvailableExtensionCard(entry) {
           showConfigureModal(entry.name);
         }
       } else {
-        showToast('Install: ' + (res.message || 'unknown error'), 'error');
+        showToast(I18n.t('extensions.installFailed', { message: res.message || 'unknown error' }), 'error');
         refreshCurrentSettingsTab();
       }
     }).catch(function(err) {
-      showToast('Install failed: ' + err.message, 'error');
+      showToast(I18n.t('extensions.installFailed', { message: err.message }), 'error');
       refreshCurrentSettingsTab();
     });
   });
@@ -2805,7 +3704,7 @@ function renderMcpServerCard(entry, installedExt) {
   if (installedExt) {
     var authDot = document.createElement('span');
     authDot.className = 'ext-auth-dot ' + (installedExt.authenticated ? 'authed' : 'unauthed');
-    authDot.title = installedExt.authenticated ? 'Authenticated' : 'Not authenticated';
+    authDot.title = installedExt.authenticated ? I18n.t('auth.authenticated') : I18n.t('auth.notAuthenticated');
     header.appendChild(authDot);
   }
 
@@ -2885,10 +3784,12 @@ function renderExtensionCard(ext) {
   const card = document.createElement('div');
   var stateClass = 'state-inactive';
   if (ext.kind === 'wasm_channel') {
-    var s = ext.activation_status || 'installed';
+    var s = ext.onboarding_state || ext.activation_status || 'installed';
     if (s === 'active') stateClass = 'state-active';
+    else if (s === 'ready') stateClass = 'state-active';
     else if (s === 'failed') stateClass = 'state-error';
     else if (s === 'pairing') stateClass = 'state-pairing';
+    else if (s === 'pairing_required') stateClass = 'state-pairing';
   } else if (ext.active) {
     stateClass = 'state-active';
   }
@@ -2918,7 +3819,7 @@ function renderExtensionCard(ext) {
   if (ext.kind !== 'wasm_channel') {
     const authDot = document.createElement('span');
     authDot.className = 'ext-auth-dot ' + (ext.authenticated ? 'authed' : 'unauthed');
-    authDot.title = ext.authenticated ? 'Authenticated' : 'Not authenticated';
+    authDot.title = ext.authenticated ? I18n.t('auth.authenticated') : I18n.t('auth.notAuthenticated');
     header.appendChild(authDot);
   }
 
@@ -2947,7 +3848,7 @@ function renderExtensionCard(ext) {
   if (ext.tools && ext.tools.length > 0) {
     const tools = document.createElement('div');
     tools.className = 'ext-tools';
-    tools.textContent = 'Tools: ' + ext.tools.join(', ');
+    tools.textContent = I18n.t('extensions.toolsLabel', { list: ext.tools.join(', ') });
     card.appendChild(tools);
   }
 
@@ -2965,14 +3866,14 @@ function renderExtensionCard(ext) {
 
   if (ext.kind === 'wasm_channel') {
     // WASM channels: state-based buttons (no generic Activate)
-    var status = ext.activation_status || 'installed';
-    if (status === 'active') {
+    var status = ext.onboarding_state || ext.activation_status || 'installed';
+    if (status === 'active' || status === 'ready') {
       var activeLabel = document.createElement('span');
       activeLabel.className = 'ext-active-label';
       activeLabel.textContent = I18n.t('ext.active');
       actions.appendChild(activeLabel);
       actions.appendChild(createReconfigureButton(ext.name));
-    } else if (status === 'pairing') {
+    } else if (status === 'pairing' || status === 'pairing_required') {
       var pairingLabel = document.createElement('span');
       pairingLabel.className = 'ext-pairing-label';
       pairingLabel.textContent = I18n.t('status.awaitingPairing');
@@ -2981,12 +3882,11 @@ function renderExtensionCard(ext) {
     } else if (status === 'failed') {
       actions.appendChild(createReconfigureButton(ext.name));
     } else {
-      // installed or configured: show Setup button
-      var setupBtn = document.createElement('button');
-      setupBtn.className = 'btn-ext configure';
-      setupBtn.textContent = I18n.t('ext.setup');
-      setupBtn.addEventListener('click', function() { showConfigureModal(ext.name); });
-      actions.appendChild(setupBtn);
+      var reconfigureBtn = document.createElement('button');
+      reconfigureBtn.className = 'btn-ext configure';
+      reconfigureBtn.textContent = I18n.t('extensions.reconfigure');
+      reconfigureBtn.addEventListener('click', function() { showConfigureModal(ext.name); });
+      actions.appendChild(reconfigureBtn);
     }
   } else {
     // WASM tools / MCP servers
@@ -3027,14 +3927,130 @@ function renderExtensionCard(ext) {
 
   // For WASM channels, check for pending pairing requests.
   if (ext.kind === 'wasm_channel') {
-    const pairingSection = document.createElement('div');
-    pairingSection.className = 'ext-pairing';
-    pairingSection.setAttribute('data-channel', ext.name);
-    card.appendChild(pairingSection);
-    loadPairingRequests(ext.name, pairingSection);
+    if ((ext.onboarding_state || ext.activation_status || 'installed') === 'setup_required') {
+      const setupSection = document.createElement('div');
+      setupSection.className = 'ext-onboarding';
+      card.appendChild(setupSection);
+      loadInlineChannelSetup(ext, setupSection);
+    }
+    if ((ext.onboarding_state || ext.activation_status || 'installed') === 'pairing_required'
+      || (ext.onboarding_state || ext.activation_status || 'installed') === 'pairing') {
+      const pairingSection = document.createElement('div');
+      pairingSection.className = 'ext-pairing';
+      pairingSection.setAttribute('data-channel', ext.name);
+      pairingSection.__onboarding = ext.onboarding || null;
+      card.appendChild(pairingSection);
+      if (currentUserIsAdmin()) {
+        loadPairingRequests(ext.name, pairingSection, ext.onboarding || null);
+      } else {
+        renderMemberPairingClaim(ext, pairingSection, ext.onboarding || null);
+      }
+    }
   }
 
   return card;
+}
+
+function loadInlineChannelSetup(ext, container) {
+  apiFetch('/api/extensions/' + encodeURIComponent(ext.name) + '/setup')
+    .then((setup) => {
+      const onboarding = setup.onboarding || ext.onboarding || {};
+      const secrets = Array.isArray(setup.secrets) ? setup.secrets : [];
+      if (secrets.length === 0) {
+        container.innerHTML = '';
+        return;
+      }
+
+      container.innerHTML = '';
+
+      const title = document.createElement('div');
+      title.className = 'ext-onboarding-title';
+      title.textContent = onboarding.credential_title || ('Configure credentials for ' + (ext.display_name || ext.name));
+      container.appendChild(title);
+
+      if (onboarding.credential_instructions) {
+        const text = document.createElement('div');
+        text.className = 'ext-onboarding-text';
+        text.textContent = onboarding.credential_instructions;
+        container.appendChild(text);
+      }
+
+      if (onboarding.setup_url) {
+        // Strict HTTPS validation via shared helper.
+        const parsedSetupUrl2 = parseHttpsExternalUrl(onboarding.setup_url, 'setup');
+        if (parsedSetupUrl2) {
+          const links = document.createElement('div');
+          links.className = 'auth-links';
+          const link = document.createElement('a');
+          link.href = parsedSetupUrl2.href;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = I18n.t('authRequired.getToken');
+          links.appendChild(link);
+          container.appendChild(links);
+        }
+      }
+
+      const form = document.createElement('div');
+      form.className = 'setup-form inline';
+      container.appendChild(form);
+
+      let fields = [];
+      const submit = () => submitInlineChannelSetup(ext.name, fields, container);
+      fields = buildSetupFields(form, ext.name, secrets, submit);
+
+      if (onboarding.credential_next_step) {
+        const nextStep = document.createElement('div');
+        nextStep.className = 'setup-next-step';
+        nextStep.textContent = onboarding.credential_next_step;
+        container.appendChild(nextStep);
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'ext-actions';
+      const submitBtn = document.createElement('button');
+      submitBtn.className = 'btn-ext activate';
+      submitBtn.textContent = I18n.t('config.save');
+      submitBtn.addEventListener('click', submit);
+      actions.appendChild(submitBtn);
+      container.appendChild(actions);
+    })
+    .catch(() => {
+      container.innerHTML = '';
+    });
+}
+
+function submitInlineChannelSetup(name, fields, container) {
+  const secrets = {};
+  (fields || []).forEach((field) => {
+    const value = (field.input.value || '').trim();
+    if (value) secrets[field.name] = value;
+  });
+
+  const buttons = container.querySelectorAll('button');
+  buttons.forEach((btn) => { btn.disabled = true; });
+
+  apiFetch('/api/extensions/' + encodeURIComponent(name) + '/setup', {
+    method: 'POST',
+    body: { secrets, fields: {} },
+  }).then((res) => {
+    if (!res.success) {
+      showToast(res.message || 'Configuration failed', 'error');
+      buttons.forEach((btn) => { btn.disabled = false; });
+      return;
+    }
+    if (res.onboarding_state === 'pairing_required') {
+      showPairingCard({
+        channel: name,
+        instructions: res.onboarding && res.onboarding.pairing_instructions,
+        onboarding: res.onboarding || null,
+      });
+    }
+    refreshCurrentSettingsTab();
+  }).catch((err) => {
+    buttons.forEach((btn) => { btn.disabled = false; });
+    showToast(I18n.t('extensions.configFailed', { message: err.message }), 'error');
+  });
 }
 
 function refreshCurrentSettingsTab() {
@@ -3053,7 +4069,7 @@ function activateExtension(name) {
             extension_name: name,
             auth_url: res.auth_url,
           });
-          showToast('Opening authentication for ' + name, 'info');
+          showToast(I18n.t('extensions.openingAuth', { name: name }), 'info');
           openOAuthUrl(res.auth_url);
         }
         refreshCurrentSettingsTab();
@@ -3065,16 +4081,16 @@ function activateExtension(name) {
           extension_name: name,
           auth_url: res.auth_url,
         });
-        showToast('Opening authentication for ' + name, 'info');
+        showToast(I18n.t('extensions.openingAuth', { name: name }), 'info');
         openOAuthUrl(res.auth_url);
       } else if (res.awaiting_token) {
         showConfigureModal(name);
       } else {
-        showToast('Activate failed: ' + res.message, 'error');
+        showToast(I18n.t('extensions.activateFailed', { message: res.message }), 'error');
       }
       refreshCurrentSettingsTab();
     })
-    .catch((err) => showToast('Activate failed: ' + err.message, 'error'));
+    .catch((err) => showToast(I18n.t('extensions.activateFailed', { message: err.message }), 'error'));
 }
 
 function removeExtension(name) {
@@ -3098,23 +4114,21 @@ function showConfigureModal(name) {
       const secrets = Array.isArray(setup.secrets) ? setup.secrets : [];
       const setupFields = Array.isArray(setup.fields) ? setup.fields : [];
       if (secrets.length === 0 && setupFields.length === 0) {
-        showToast('No configuration needed for ' + name, 'info');
+        showToast(I18n.t('extensions.noConfigNeeded', { name: name }), 'info');
         return;
       }
-      renderConfigureModal(name, secrets, setupFields);
+      renderConfigureModal(name, secrets, setupFields, setup.onboarding || null);
     })
-    .catch((err) => showToast('Failed to load setup: ' + err.message, 'error'));
+    .catch((err) => showToast(I18n.t('extensions.setupLoadFailed', { message: err.message }), 'error'));
 }
 
-function renderConfigureModal(name, secrets, setupFields) {
+function renderConfigureModal(name, secrets, setupFields, onboarding) {
   closeConfigureModal();
   const overlay = document.createElement('div');
   overlay.className = 'configure-overlay';
   overlay.setAttribute('data-extension-name', name);
-  overlay.dataset.telegramVerificationState = 'idle';
   overlay.addEventListener('click', (e) => {
     if (e.target !== overlay) return;
-    if (name === 'telegram' && overlay.dataset.telegramVerificationState === 'waiting') return;
     closeConfigureModal();
   });
 
@@ -3125,10 +4139,10 @@ function renderConfigureModal(name, secrets, setupFields) {
   header.textContent = I18n.t('config.title', { name: name });
   modal.appendChild(header);
 
-  if (name === 'telegram') {
+  if (onboarding && onboarding.credential_instructions) {
     const hint = document.createElement('div');
     hint.className = 'configure-hint';
-    hint.textContent = I18n.t('config.telegramOwnerHint');
+    hint.textContent = onboarding.credential_instructions;
     modal.appendChild(hint);
   }
 
@@ -3228,11 +4242,6 @@ function renderConfigureModal(name, secrets, setupFields) {
   error.style.display = 'none';
   modal.appendChild(error);
 
-  const status = document.createElement('div');
-  status.className = 'configure-inline-status';
-  status.style.display = 'none';
-  modal.appendChild(status);
-
   const actions = document.createElement('div');
   actions.className = 'configure-actions';
 
@@ -3255,67 +4264,6 @@ function renderConfigureModal(name, secrets, setupFields) {
   if (fields.length > 0) fields[0].input.focus();
 }
 
-function renderTelegramVerificationChallenge(overlay, verification) {
-  if (!overlay || !verification) return;
-  const modal = overlay.querySelector('.configure-modal');
-  if (!modal) return;
-  const telegramField = modal.querySelector('.configure-field[data-secret-name="telegram_bot_token"]');
-
-  let panel = modal.querySelector('.configure-verification');
-  if (!panel) {
-    panel = document.createElement('div');
-    panel.className = 'configure-verification';
-  }
-  if (telegramField && telegramField.parentNode) {
-    telegramField.insertAdjacentElement('afterend', panel);
-  } else {
-    modal.insertBefore(
-      panel,
-      modal.querySelector('.configure-inline-error') || modal.querySelector('.configure-actions')
-    );
-  }
-
-  panel.innerHTML = '';
-
-  const title = document.createElement('div');
-  title.className = 'configure-verification-title';
-  title.textContent = I18n.t('config.telegramChallengeTitle');
-  panel.appendChild(title);
-
-  const instructions = document.createElement('div');
-  instructions.className = 'configure-verification-instructions';
-  instructions.textContent = verification.instructions;
-  panel.appendChild(instructions);
-
-  const commandLabel = document.createElement('div');
-  commandLabel.className = 'configure-verification-instructions';
-  commandLabel.textContent = I18n.t('config.telegramCommandLabel');
-  panel.appendChild(commandLabel);
-
-  const command = document.createElement('code');
-  command.className = 'configure-verification-code';
-  command.textContent = '/start ' + verification.code;
-  panel.appendChild(command);
-
-  if (verification.deep_link) {
-    const link = document.createElement('a');
-    link.className = 'configure-verification-link';
-    link.href = verification.deep_link;
-    link.target = '_blank';
-    link.rel = 'noreferrer noopener';
-    link.textContent = I18n.t('config.telegramOpenBot');
-    panel.appendChild(link);
-  }
-}
-
-function getConfigurePrimaryButton(overlay) {
-  return overlay && overlay.querySelector('.configure-actions button.btn-ext.activate');
-}
-
-function getConfigureCancelButton(overlay) {
-  return overlay && overlay.querySelector('.configure-actions button.btn-ext.remove');
-}
-
 function setConfigureInlineError(overlay, message) {
   const error = overlay && overlay.querySelector('.configure-inline-error');
   if (!error) return;
@@ -3325,36 +4273,6 @@ function setConfigureInlineError(overlay, message) {
 
 function clearConfigureInlineError(overlay) {
   setConfigureInlineError(overlay, '');
-}
-
-function setConfigureInlineStatus(overlay, message) {
-  const status = overlay && overlay.querySelector('.configure-inline-status');
-  if (!status) return;
-  status.textContent = message || '';
-  status.style.display = message ? 'block' : 'none';
-}
-
-function setTelegramConfigureState(overlay, fields, state) {
-  if (!overlay) return;
-  overlay.dataset.telegramVerificationState = state;
-
-  const primaryBtn = getConfigurePrimaryButton(overlay);
-  const cancelBtn = getConfigureCancelButton(overlay);
-  const waiting = state === 'waiting';
-  const retry = state === 'retry';
-
-  setConfigureInlineStatus(overlay, waiting ? I18n.t('config.telegramOwnerWaiting') : '');
-
-  if (primaryBtn) {
-    primaryBtn.style.display = waiting ? 'none' : '';
-    primaryBtn.disabled = false;
-    primaryBtn.textContent = retry ? I18n.t('config.telegramStartOver') : I18n.t('config.save');
-  }
-  if (cancelBtn) cancelBtn.disabled = waiting;
-}
-
-function startTelegramAutoVerify(name, fields) {
-  window.setTimeout(() => submitConfigureModal(name, fields, { telegramAutoVerify: true }), 0);
 }
 
 function submitConfigureModal(name, fields, options) {
@@ -3374,15 +4292,11 @@ function submitConfigureModal(name, fields, options) {
   }
 
   const overlay = getConfigureOverlay(name) || document.querySelector('.configure-overlay');
-  const isTelegram = name === 'telegram';
   clearConfigureInlineError(overlay);
 
   // Disable buttons to prevent double-submit
   var btns = overlay ? overlay.querySelectorAll('.configure-actions button') : [];
   btns.forEach(function(b) { b.disabled = true; });
-  if (overlay && isTelegram) {
-    setTelegramConfigureState(overlay, fields, 'waiting');
-  }
 
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/setup', {
     method: 'POST',
@@ -3390,34 +4304,15 @@ function submitConfigureModal(name, fields, options) {
   })
     .then((res) => {
       if (res.success) {
-        if (res.verification && isTelegram) {
-          renderTelegramVerificationChallenge(overlay, res.verification);
-          fields.forEach(function(f) { f.input.value = ''; });
-          setTelegramConfigureState(overlay, fields, 'waiting');
-          // Once the verification challenge is rendered inline, the global auth lock
-          // should not keep the chat composer disabled for this setup-driven flow.
-          setAuthFlowPending(false);
-          enableChatInput();
-          if (!options.telegramAutoVerify) {
-            startTelegramAutoVerify(name, fields);
-            return;
-          }
-          setTelegramConfigureState(overlay, fields, 'retry');
-          setConfigureInlineError(overlay, I18n.t('config.telegramStartOverHint'));
-          return;
-        }
-
         closeConfigureModal();
         if (res.auth_url) {
           showAuthCard({
             extension_name: name,
             auth_url: res.auth_url,
           });
-          showToast('Opening OAuth authorization for ' + name, 'info');
+          showToast(I18n.t('extensions.openingOAuth', { name: name }), 'info');
           openOAuthUrl(res.auth_url);
           refreshCurrentSettingsTab();
-        } else if (res.needs_restart) {
-          showToast('Configured ' + name + '. Restart IronClaw to apply all changes.', 'info');
         }
         // For non-OAuth success: the server always broadcasts auth_completed SSE,
         // which will show the toast and refresh extensions — no need to do it here too.
@@ -3425,29 +4320,13 @@ function submitConfigureModal(name, fields, options) {
         // Keep modal open so the user can correct their input and retry.
         btns.forEach(function(b) { b.disabled = false; });
         setConfigureInlineError(overlay, res.message || 'Configuration failed');
-        if (isTelegram) {
-          const hasVerification = overlay && overlay.querySelector('.configure-verification');
-          if (options.telegramAutoVerify || hasVerification) {
-            setTelegramConfigureState(overlay, fields, 'retry');
-          } else {
-            setTelegramConfigureState(overlay, fields, 'idle');
-          }
-        }
         showToast(res.message || 'Configuration failed', 'error');
       }
     })
     .catch((err) => {
       btns.forEach(function(b) { b.disabled = false; });
       setConfigureInlineError(overlay, 'Configuration failed: ' + err.message);
-      if (isTelegram) {
-        const hasVerification = overlay && overlay.querySelector('.configure-verification');
-        if (options.telegramAutoVerify || hasVerification) {
-          setTelegramConfigureState(overlay, fields, 'retry');
-        } else {
-          setTelegramConfigureState(overlay, fields, 'idle');
-        }
-      }
-      showToast('Configuration failed: ' + err.message, 'error');
+      showToast(I18n.t('extensions.configFailed', { message: err.message }), 'error');
     });
 }
 
@@ -3461,11 +4340,15 @@ function closeConfigureModal(extensionName) {
   }
 }
 
+function currentUserIsAdmin() {
+  return !!(window._currentUser && window._currentUser.role === 'admin');
+}
+
 // Validate that a server-supplied OAuth URL is HTTPS before opening a popup.
 // Rejects javascript:, data:, and other non-HTTPS schemes to prevent URL-injection.
 // Uses the URL constructor to safely parse and validate the scheme, which also
 // handles non-string values (objects, null, etc.) that would throw on .startsWith().
-function openOAuthUrl(url) {
+function parseHttpsExternalUrl(url, label) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -3473,25 +4356,112 @@ function openOAuthUrl(url) {
       throw new Error('non-HTTPS protocol: ' + parsed.protocol);
     }
   } catch (e) {
-    console.warn('Blocked invalid/non-HTTPS OAuth URL:', url, e.message);
-    showToast('Invalid OAuth URL returned by server', 'error');
-    return;
+    console.warn(`Blocked invalid/non-HTTPS ${label} URL:`, url, e.message);
+    showToast(I18n.t('extensions.invalidOAuthUrl'), 'error');
+    return null;
   }
-  window.open(parsed.href, '_blank', 'width=600,height=700');
+  return parsed;
+}
+
+function parseHttpsOAuthUrl(url) {
+  return parseHttpsExternalUrl(url, 'OAuth');
+}
+
+function openOAuthUrl(url) {
+  const parsed = parseHttpsOAuthUrl(url);
+  if (!parsed) return;
+  // `noopener,noreferrer` defends against tabnabbing — without these the
+  // OAuth provider page can read `window.opener` and reach back into the
+  // app tab. `noreferrer` also strips the Referer header.
+  const opened = window.open(
+    parsed.href,
+    '_blank',
+    'width=600,height=700,noopener,noreferrer',
+  );
+  // Some browsers ignore the noopener feature flag in window.open's third
+  // argument when the window is non-null; explicitly null the opener as a
+  // belt-and-suspenders defense.
+  if (opened) {
+    try {
+      opened.opener = null;
+    } catch (_) {
+      /* opener may already be null in cross-origin contexts */
+    }
+  }
 }
 
 // --- Pairing ---
 
-function loadPairingRequests(channel, container) {
+function loadPairingRequests(channel, container, onboarding) {
+  if (!currentUserIsAdmin()) return;
+
   apiFetch('/api/pairing/' + encodeURIComponent(channel))
     .then(data => {
       container.innerHTML = '';
-      if (!data.requests || data.requests.length === 0) return;
+
+      const info = onboarding || {};
 
       const heading = document.createElement('div');
       heading.className = 'pairing-heading';
-      heading.textContent = 'Pending pairing requests';
+      heading.textContent = info.pairing_title || I18n.t('extensions.claimPairing');
       container.appendChild(heading);
+
+      const help = document.createElement('div');
+      help.className = 'pairing-help';
+      help.textContent = info.pairing_instructions || I18n.t('extensions.claimPairingHelp');
+      container.appendChild(help);
+
+      const manual = document.createElement('div');
+      manual.className = 'pairing-row pairing-manual';
+
+      const input = document.createElement('input');
+      input.className = 'pairing-manual-input';
+      input.type = 'text';
+      input.placeholder = I18n.t('extensions.pairingCodePlaceholder');
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.autocapitalize = 'characters';
+      input.maxLength = 64;
+      input.addEventListener('keydown', function(event) {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          approvePairing(channel, input.value, {
+            onSuccess: function() {
+              input.value = '';
+              loadPairingRequests(channel, container, onboarding);
+            }
+          });
+        }
+      });
+      manual.appendChild(input);
+
+      const manualBtn = document.createElement('button');
+      manualBtn.className = 'btn-ext activate pairing-manual-submit';
+      manualBtn.textContent = I18n.t('approval.approve');
+      manualBtn.addEventListener('click', function() {
+        approvePairing(channel, input.value, {
+          onSuccess: function() {
+            input.value = '';
+            loadPairingRequests(channel, container, onboarding);
+          }
+        });
+      });
+      manual.appendChild(manualBtn);
+      container.appendChild(manual);
+
+      if (info.restart_instructions) {
+        const restart = document.createElement('div');
+        restart.className = 'pairing-help pairing-restart';
+        restart.textContent = info.restart_instructions;
+        container.appendChild(restart);
+      }
+
+      if (!data.requests || data.requests.length === 0) return;
+
+      const pendingHeading = document.createElement('div');
+      pendingHeading.className = 'pairing-heading';
+      pendingHeading.textContent = I18n.t('extensions.pendingPairing');
+      container.appendChild(pendingHeading);
 
       data.requests.forEach(req => {
         const row = document.createElement('div');
@@ -3504,13 +4474,19 @@ function loadPairingRequests(channel, container) {
 
         const sender = document.createElement('span');
         sender.className = 'pairing-sender';
-        sender.textContent = 'from ' + req.sender_id;
+        sender.textContent = I18n.t('extensions.from') + ' ' + req.sender_id;
         row.appendChild(sender);
 
         const btn = document.createElement('button');
         btn.className = 'btn-ext activate';
-        btn.textContent = 'Approve';
-        btn.addEventListener('click', () => approvePairing(channel, req.code, container));
+        btn.textContent = I18n.t('common.approve');
+        btn.addEventListener('click', function() {
+          approvePairing(channel, req.code, {
+            onSuccess: function() {
+              loadPairingRequests(channel, container, onboarding);
+            }
+          });
+        });
         row.appendChild(btn);
 
         container.appendChild(row);
@@ -3519,25 +4495,106 @@ function loadPairingRequests(channel, container) {
     .catch(() => {});
 }
 
-function approvePairing(channel, code, container) {
-  apiFetch('/api/pairing/' + encodeURIComponent(channel) + '/approve', {
+function renderMemberPairingClaim(ext, container, onboarding) {
+  const info = onboarding || {};
+  const heading = document.createElement('div');
+  heading.className = 'pairing-heading';
+  heading.textContent = info.pairing_title || I18n.t('extensions.claimPairing');
+  container.appendChild(heading);
+
+  const help = document.createElement('div');
+  help.className = 'pairing-help';
+  help.textContent = info.pairing_instructions || I18n.t('extensions.claimPairingHelp');
+  container.appendChild(help);
+
+  const row = document.createElement('div');
+  row.className = 'pairing-row';
+
+  const input = document.createElement('input');
+  input.className = 'pairing-input';
+  input.type = 'text';
+  input.placeholder = I18n.t('extensions.pairingCodePlaceholder');
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.maxLength = 64;
+  row.appendChild(input);
+
+  const btn = document.createElement('button');
+  btn.className = 'btn-ext activate';
+  btn.textContent = I18n.t('extensions.claimPairingAction');
+  btn.addEventListener('click', function() {
+    approvePairing(ext.name, input.value, {
+      onSuccess: function() {
+        input.value = '';
+      }
+    });
+  });
+  row.appendChild(btn);
+
+  input.addEventListener('keydown', function(event) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      btn.click();
+    }
+  });
+
+  container.appendChild(row);
+
+  if (info.restart_instructions) {
+    const restart = document.createElement('div');
+    restart.className = 'pairing-help pairing-restart';
+    restart.textContent = info.restart_instructions;
+    container.appendChild(restart);
+  }
+}
+
+function approvePairing(channel, code, options) {
+  options = options || {};
+  const normalizedCode = (code || '').trim().toUpperCase();
+  if (!normalizedCode) {
+    const message = I18n.t('extensions.pairingCodeRequired');
+    if (typeof options.onError === 'function') {
+      options.onError(message);
+    } else {
+      showToast(message, 'error');
+    }
+    return Promise.resolve();
+  }
+
+  return apiFetch('/api/pairing/' + encodeURIComponent(channel) + '/approve', {
     method: 'POST',
-    body: { code },
+    body: { code: normalizedCode },
   }).then(res => {
     if (res.success) {
-      showToast('Pairing approved', 'success');
-      refreshCurrentSettingsTab();
+      _recentLocalPairingApprovals.set(channel, Date.now());
+      if (!options.skipSuccessToast) {
+        showToast(I18n.t('extensions.pairingApproved'), 'success');
+      }
+      if (typeof options.onSuccess === 'function') options.onSuccess(res);
+      if (!options.skipRefresh && currentTab === 'settings') refreshCurrentSettingsTab();
     } else {
-      showToast(res.message || 'Approve failed', 'error');
+      const message = res.message || I18n.t('extensions.approveFailed');
+      if (typeof options.onError === 'function') {
+        options.onError(message);
+      } else {
+        showToast(message, 'error');
+      }
     }
-  }).catch(err => showToast('Error: ' + err.message, 'error'));
+  }).catch(err => {
+    const message = I18n.t('extensions.pairingError', { message: err.message });
+    if (typeof options.onError === 'function') {
+      options.onError(message);
+    } else {
+      showToast(message, 'error');
+    }
+  });
 }
 
 function startPairingPoll() {
   stopPairingPoll();
   pairingPollInterval = setInterval(function() {
     document.querySelectorAll('.ext-pairing[data-channel]').forEach(function(el) {
-      loadPairingRequests(el.getAttribute('data-channel'), el);
+      loadPairingRequests(el.getAttribute('data-channel'), el, el.__onboarding || null);
     });
   }, 10000);
 }
@@ -3555,19 +4612,20 @@ function renderWasmChannelStepper(ext) {
   var stepper = document.createElement('div');
   stepper.className = 'ext-stepper';
 
-  var status = ext.activation_status || 'installed';
+  var status = ext.onboarding_state || ext.activation_status || 'installed';
+  var requiresPairing = !!(ext.onboarding && ext.onboarding.requires_pairing);
 
   var steps = [
-    { label: 'Installed', key: 'installed' },
-    { label: 'Configured', key: 'configured' },
-    { label: status === 'pairing' ? 'Awaiting Pairing' : 'Active', key: 'active' },
+    { label: I18n.t('missions.stepConfigured'), key: 'setup_required' },
+    { label: requiresPairing ? I18n.t('missions.stepAwaitingPairing') : I18n.t('extensions.activate'), key: 'pairing_required' },
+    { label: I18n.t('missions.stepActive'), key: 'ready' },
   ];
 
   var reachedIdx;
-  if (status === 'active') reachedIdx = 2;
-  else if (status === 'pairing') reachedIdx = 2;
+  if (status === 'active' || status === 'ready') reachedIdx = 2;
+  else if (status === 'pairing' || status === 'pairing_required') reachedIdx = 1;
   else if (status === 'failed') reachedIdx = 2;
-  else if (status === 'configured') reachedIdx = 1;
+  else if (status === 'configured' || status === 'activation_in_progress') reachedIdx = 1;
   else reachedIdx = 0;
 
   for (var i = 0; i < steps.length; i++) {
@@ -3584,9 +4642,11 @@ function renderWasmChannelStepper(ext) {
     } else if (i === reachedIdx) {
       if (status === 'failed') {
         stepState = 'failed';
-      } else if (status === 'pairing') {
+      } else if (status === 'pairing' || status === 'pairing_required' || status === 'activation_in_progress') {
         stepState = 'in-progress';
-      } else if (status === 'active' || status === 'configured' || status === 'installed') {
+      } else if (status === 'setup_required') {
+        stepState = 'in-progress';
+      } else if (status === 'active' || status === 'ready' || status === 'configured' || status === 'installed') {
         stepState = 'completed';
       } else {
         stepState = 'pending';
@@ -3691,25 +4751,25 @@ function renderJobsList(jobs) {
 }
 
 function cancelJob(jobId) {
-  if (!confirm('Cancel this job?')) return;
+  if (!confirm(I18n.t('jobs.confirmCancel'))) return;
   apiFetch('/api/jobs/' + jobId + '/cancel', { method: 'POST' })
     .then(() => {
-      showToast('Job cancelled', 'success');
+      showToast(I18n.t('jobs.cancelled'), 'success');
       if (currentJobId) openJobDetail(currentJobId);
       else loadJobs();
     })
     .catch((err) => {
-      showToast('Failed to cancel job: ' + err.message, 'error');
+      showToast(I18n.t('jobs.cancelFailed', { message: err.message }), 'error');
     });
 }
 
 function restartJob(jobId) {
   apiFetch('/api/jobs/' + jobId + '/restart', { method: 'POST' })
     .then((res) => {
-      showToast('Job restarted as ' + (res.new_job_id || '').substring(0, 8), 'success');
+      showToast(I18n.t('jobs.restarted', { id: (res.new_job_id || '').substring(0, 8) }), 'success');
     })
     .catch((err) => {
-      showToast('Failed to restart job: ' + err.message, 'error');
+      showToast(I18n.t('jobs.restartFailed', { message: err.message }), 'error');
     })
     .finally(() => {
       loadJobs();
@@ -3743,7 +4803,7 @@ function renderJobDetail(job) {
   const header = document.createElement('div');
   header.className = 'job-detail-header';
 
-  let headerHtml = '<button class="btn-back" data-action="close-job-detail">&larr; Back</button>'
+  let headerHtml = '<button class="btn-back" data-action="close-job-detail">' + escapeHtml(I18n.t('common.back')) + '</button>'
     + '<h2>' + escapeHtml(job.title) + '</h2>'
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
@@ -3751,7 +4811,7 @@ function renderJobDetail(job) {
     headerHtml += '<button class="btn-restart" data-action="restart-job" data-id="' + escapeHtml(job.id) + '">Retry</button>';
   }
   if (job.browse_url) {
-    headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank">Browse Files</a>';
+    headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank" rel="noopener noreferrer">Browse Files</a>';
   }
 
   header.innerHTML = headerHtml;
@@ -3805,13 +4865,13 @@ function renderJobOverview(container, job) {
   // Metadata grid
   const grid = document.createElement('div');
   grid.className = 'job-meta-grid';
-  grid.innerHTML = metaItem('Job ID', job.id)
-    + metaItem('State', job.state)
-    + metaItem('Created', formatDate(job.created_at))
-    + metaItem('Started', formatDate(job.started_at))
-    + metaItem('Completed', formatDate(job.completed_at))
-    + metaItem('Duration', formatDuration(job.elapsed_secs))
-    + (job.job_mode ? metaItem('Mode', job.job_mode) : '');
+  grid.innerHTML = metaItem(I18n.t('jobs.id'), job.id)
+    + metaItem(I18n.t('jobs.state'), job.state)
+    + metaItem(I18n.t('jobs.created'), formatDate(job.created_at))
+    + metaItem(I18n.t('jobs.startedLabel'), formatDate(job.started_at))
+    + metaItem(I18n.t('jobs.completedLabel'), formatDate(job.completed_at))
+    + metaItem(I18n.t('jobs.duration'), formatDuration(job.elapsed_secs))
+    + (job.job_mode ? metaItem(I18n.t('jobs.mode'), job.job_mode) : '');
   container.appendChild(grid);
 
   // Description
@@ -3819,7 +4879,7 @@ function renderJobOverview(container, job) {
     const descSection = document.createElement('div');
     descSection.className = 'job-description';
     const descHeader = document.createElement('h3');
-    descHeader.textContent = 'Description';
+    descHeader.textContent = I18n.t('jobs.description');
     descSection.appendChild(descHeader);
     const descBody = document.createElement('div');
     descBody.className = 'job-description-body';
@@ -3833,7 +4893,7 @@ function renderJobOverview(container, job) {
     const timelineSection = document.createElement('div');
     timelineSection.className = 'job-timeline-section';
     const tlHeader = document.createElement('h3');
-    tlHeader.textContent = 'State Transitions';
+    tlHeader.textContent = I18n.t('jobs.stateTransitions');
     timelineSection.appendChild(tlHeader);
 
     const timeline = document.createElement('div');
@@ -4002,15 +5062,15 @@ function renderJobActivity(container, job) {
     + '<option value="tool_use">Tool Calls</option>'
     + '<option value="tool_result">Results</option>'
     + '</select>'
-    + '<label class="logs-checkbox"><input type="checkbox" id="activity-autoscroll" checked> Auto-scroll</label>'
+    + '<label class="logs-checkbox"><input type="checkbox" id="activity-autoscroll" checked> ' + escapeHtml(I18n.t('jobs.autoScroll')) + '</label>'
     + '</div>'
     + '<div class="activity-terminal" id="activity-terminal"></div>';
 
   if (job && job.can_prompt === true) {
     html += '<div class="activity-input-bar" id="activity-input-bar">'
-      + '<input type="text" id="activity-prompt-input" placeholder="Send follow-up prompt..." />'
-      + '<button id="activity-send-btn">Send</button>'
-      + '<button id="activity-done-btn" title="Signal done">Done</button>'
+      + '<input type="text" id="activity-prompt-input" placeholder="' + escapeHtml(I18n.t('jobs.followUpPlaceholder')) + '" />'
+      + '<button id="activity-send-btn">' + escapeHtml(I18n.t('chat.send')) + '</button>'
+      + '<button id="activity-done-btn" title="' + escapeHtml(I18n.t('jobs.signalDone')) + '">' + escapeHtml(I18n.t('jobs.done')) + '</button>'
       + '</div>';
   }
 
@@ -4236,7 +5296,7 @@ function openRoutineDetail(id) {
   apiFetch('/api/routines/' + id).then((routine) => {
     renderRoutineDetail(routine);
   }).catch((err) => {
-    showToast('Failed to load routine: ' + err.message, 'error');
+    showToast(I18n.t('routines.loadFailed', { message: err.message }), 'error');
   });
 }
 
@@ -4268,13 +5328,13 @@ function renderRoutineDetail(routine) {
 
   // Metadata grid
   html += '<div class="job-meta-grid">'
-    + metaItem('Routine ID', routine.id)
-    + metaItem('Enabled', routine.enabled ? 'Yes' : 'No')
-    + metaItem('Run Count', routine.run_count)
-    + metaItem('Failures', routine.consecutive_failures)
-    + metaItem('Last Run', formatDate(routine.last_run_at))
-    + metaItem('Next Fire', formatDate(routine.next_fire_at))
-    + metaItem('Created', formatDate(routine.created_at))
+    + metaItem(I18n.t('routines.id'), routine.id)
+    + metaItem(I18n.t('routines.enabled'), routine.enabled ? I18n.t('settings.on') : I18n.t('settings.off'))
+    + metaItem(I18n.t('routines.runCount'), routine.run_count)
+    + metaItem(I18n.t('routines.failures'), routine.consecutive_failures)
+    + metaItem(I18n.t('routines.lastRun'), formatDate(routine.last_run_at))
+    + metaItem(I18n.t('routines.nextFire'), formatDate(routine.next_fire_at))
+    + metaItem(I18n.t('routines.created'), formatDate(routine.created_at))
     + '</div>';
 
   // Description
@@ -4357,32 +5417,279 @@ function renderRoutineDetail(routine) {
 function triggerRoutine(id) {
   apiFetch('/api/routines/' + id + '/trigger', { method: 'POST' })
     .then(() => {
-      showToast('Routine triggered', 'success');
+      showToast(I18n.t('routines.triggered'), 'success');
       if (currentRoutineId === id) openRoutineDetail(id);
       else loadRoutines();
     })
-    .catch((err) => showToast('Trigger failed: ' + err.message, 'error'));
+    .catch((err) => showToast(I18n.t('routines.triggerFailed', { message: err.message }), 'error'));
 }
 
 function toggleRoutine(id) {
   apiFetch('/api/routines/' + id + '/toggle', { method: 'POST' })
     .then((res) => {
-      showToast('Routine ' + (res.status || 'toggled'), 'success');
+      showToast(I18n.t('routines.toggled', { status: res.status || 'toggled' }), 'success');
       if (currentRoutineId) openRoutineDetail(currentRoutineId);
       else loadRoutines();
     })
-    .catch((err) => showToast('Toggle failed: ' + err.message, 'error'));
+    .catch((err) => showToast(I18n.t('routines.toggleFailed', { message: err.message }), 'error'));
 }
 
 function deleteRoutine(id, name) {
-  if (!confirm('Delete routine "' + name + '"?')) return;
+  if (!confirm(I18n.t('routines.confirmDelete', { name: name }))) return;
   apiFetch('/api/routines/' + id, { method: 'DELETE' })
     .then(() => {
-      showToast('Routine deleted', 'success');
+      showToast(I18n.t('routines.deleted'), 'success');
       if (currentRoutineId === id) closeRoutineDetail();
       else loadRoutines();
     })
-    .catch((err) => showToast('Delete failed: ' + err.message, 'error'));
+    .catch((err) => showToast(I18n.t('routines.deleteFailed', { message: err.message }), 'error'));
+}
+
+// ── Missions ──────────────────────────────────────────────
+
+let currentMissionId = null;
+
+function loadMissions() {
+  currentMissionId = null;
+  const detail = document.getElementById('mission-detail');
+  if (detail) detail.style.display = 'none';
+  const table = document.getElementById('missions-table');
+  if (table) table.style.display = '';
+
+  Promise.all([
+    apiFetch('/api/engine/missions/summary'),
+    apiFetch('/api/engine/missions'),
+  ]).then(([summary, listData]) => {
+    renderMissionsSummary(summary);
+    renderMissionsList(listData.missions);
+  }).catch(() => {});
+}
+
+function renderMissionsSummary(s) {
+  document.getElementById('missions-summary').innerHTML = ''
+    + summaryCard(I18n.t('missions.summary.total'), s.total, '')
+    + summaryCard(I18n.t('missions.summary.active'), s.active, 'active')
+    + summaryCard(I18n.t('missions.summary.paused'), s.paused, '')
+    + summaryCard(I18n.t('missions.summary.completed'), s.completed, 'completed')
+    + summaryCard(I18n.t('missions.summary.failed'), s.failed, 'failed');
+}
+
+function renderMissionsList(missions) {
+  const tbody = document.getElementById('missions-tbody');
+  const empty = document.getElementById('missions-empty');
+
+  if (!missions || missions.length === 0) {
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+
+  empty.style.display = 'none';
+  tbody.innerHTML = missions.map((m) => {
+    const statusClass = m.status === 'Active' ? 'in_progress'
+      : m.status === 'Completed' ? 'completed'
+      : m.status === 'Paused' ? 'pending'
+      : 'failed';
+
+    return '<tr class="mission-row" data-action="open-mission" data-id="' + escapeHtml(m.id) + '">'
+      + '<td>' + escapeHtml(m.name) + '</td>'
+      + '<td class="truncate">' + escapeHtml(m.goal) + '</td>'
+      + '<td>' + escapeHtml(m.cadence_description || m.cadence_type) + '</td>'
+      + '<td>' + m.thread_count + '</td>'
+      + '<td><span class="badge ' + statusClass + '">' + escapeHtml(m.status) + '</span></td>'
+      + '<td>'
+      + (m.status === 'Active' ? '<button class="btn-cancel" data-action="pause-mission" data-id="' + escapeHtml(m.id) + '">' + escapeHtml(I18n.t('missions.pause')) + '</button> ' : '')
+      + (m.status === 'Paused' ? '<button class="btn-restart" data-action="resume-mission" data-id="' + escapeHtml(m.id) + '">' + escapeHtml(I18n.t('missions.resume')) + '</button> ' : '')
+      + '<button class="btn-restart" data-action="fire-mission" data-id="' + escapeHtml(m.id) + '">' + escapeHtml(I18n.t('missions.fire')) + '</button>'
+      + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+function openMissionDetail(id) {
+  currentMissionId = id;
+  apiFetch('/api/engine/missions/' + id).then((data) => {
+    renderMissionDetail(data.mission);
+  }).catch((err) => {
+    showToast(I18n.t('missions.loadFailed', { message: err.message }), 'error');
+  });
+}
+
+function closeMissionDetail() {
+  currentMissionId = null;
+  loadMissions();
+}
+
+function renderMissionDetail(m) {
+  const table = document.getElementById('missions-table');
+  if (table) table.style.display = 'none';
+  document.getElementById('missions-empty').style.display = 'none';
+
+  const detail = document.getElementById('mission-detail');
+  detail.style.display = 'block';
+
+  const statusClass = m.status === 'Active' ? 'in_progress'
+    : m.status === 'Completed' ? 'completed'
+    : m.status === 'Paused' ? 'pending'
+    : 'failed';
+
+  let html = '<div class="job-detail-header">'
+    + '<button class="btn-back" data-action="close-mission-detail">' + escapeHtml(I18n.t('common.back')) + '</button>'
+    + '<h2>' + escapeHtml(m.name) + '</h2>'
+    + '<span class="badge ' + statusClass + '">' + escapeHtml(m.status) + '</span>'
+    + '</div>';
+
+  // Goal — full-width markdown block
+  html += '<div class="job-description"><h3>Goal</h3>'
+    + '<div class="job-description-body">' + renderMarkdown(m.goal) + '</div></div>';
+
+  html += '<div class="job-meta-grid">'
+    + metaItem(I18n.t('missions.cadence'), m.cadence_description || m.cadence_type)
+    + metaItem(I18n.t('missions.status'), m.status)
+    + metaItem(I18n.t('missions.threadsToday'), m.threads_today + ' / ' + (m.max_threads_per_day || '∞'))
+    + metaItem(I18n.t('missions.totalThreads'), m.thread_count)
+    + metaItem(I18n.t('missions.created'), formatDate(m.created_at))
+    + metaItem(I18n.t('missions.nextFire'), m.next_fire_at ? formatDate(m.next_fire_at) : I18n.t('common.noData'))
+    + '</div>';
+
+  if (m.current_focus) {
+    html += '<div class="job-description"><h3>Current Focus</h3>'
+      + '<div class="job-description-body">' + renderMarkdown(m.current_focus) + '</div></div>';
+  }
+
+  if (m.success_criteria) {
+    html += '<div class="job-description"><h3>Success Criteria</h3>'
+      + '<div class="job-description-body">' + renderMarkdown(m.success_criteria) + '</div></div>';
+  }
+
+  if (m.notify_channels && m.notify_channels.length > 0) {
+    html += '<div class="job-description"><h3>Notify Channels</h3>'
+      + '<div class="job-description-body">' + m.notify_channels.map(escapeHtml).join(', ') + '</div></div>';
+  }
+
+  if (m.approach_history && m.approach_history.length > 0) {
+    html += '<div class="job-description"><h3>Approach History</h3>';
+    m.approach_history.forEach((a, i) => {
+      html += '<div class="job-description-body" style="margin-bottom:8px">'
+        + '<strong>Run ' + (i + 1) + '</strong><br>'
+        + renderMarkdown(a) + '</div>';
+    });
+    html += '</div>';
+  }
+
+  if (m.threads && m.threads.length > 0) {
+    html += '<div class="job-description"><h3>Spawned Threads</h3>'
+      + '<table class="missions-table"><thead><tr>'
+      + '<th>Goal</th><th>Type</th><th>State</th><th>Steps</th><th>Tokens</th><th>Created</th>'
+      + '</tr></thead><tbody>';
+    m.threads.forEach((t) => {
+      var tState = t.state === 'Done' || t.state === 'Completed' ? 'completed'
+        : t.state === 'Failed' ? 'failed'
+        : t.state === 'Running' ? 'in_progress'
+        : 'pending';
+      html += '<tr class="mission-row" data-action="open-engine-thread" data-id="' + escapeHtml(t.id) + '">'
+        + '<td class="truncate">' + escapeHtml(t.goal) + '</td>'
+        + '<td>' + escapeHtml(t.thread_type) + '</td>'
+        + '<td><span class="badge ' + tState + '">' + escapeHtml(t.state) + '</span></td>'
+        + '<td>' + t.step_count + '</td>'
+        + '<td>' + t.total_tokens.toLocaleString() + '</td>'
+        + '<td>' + formatDate(t.created_at) + '</td>'
+        + '</tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+
+  // Action buttons
+  html += '<div style="margin-top:16px;">';
+  if (m.status === 'Active') {
+    html += '<button class="btn-cancel" data-action="pause-mission" data-id="' + escapeHtml(m.id) + '">' + escapeHtml(I18n.t('missions.pause')) + '</button> ';
+  }
+  if (m.status === 'Paused') {
+    html += '<button class="btn-restart" data-action="resume-mission" data-id="' + escapeHtml(m.id) + '">' + escapeHtml(I18n.t('missions.resume')) + '</button> ';
+  }
+  html += '<button class="btn-restart" data-action="fire-mission" data-id="' + escapeHtml(m.id) + '">' + escapeHtml(I18n.t('missions.fireNow')) + '</button>';
+  html += '</div>';
+
+  detail.innerHTML = html;
+}
+
+function openEngineThread(threadId) {
+  apiFetch('/api/engine/threads/' + threadId).then((data) => {
+    var t = data.thread;
+    var detail = document.getElementById('mission-detail');
+
+    var stateClass = t.state === 'Done' || t.state === 'Completed' ? 'completed'
+      : t.state === 'Failed' ? 'failed'
+      : t.state === 'Running' ? 'in_progress'
+      : 'pending';
+
+    var html = '<div class="job-detail-header">'
+      + '<button class="btn-back" data-action="back-to-mission">' + escapeHtml(I18n.t('missions.backToMission')) + '</button>'
+      + '<h2>Thread: ' + escapeHtml(t.goal) + '</h2>'
+      + '<span class="badge ' + stateClass + '">' + escapeHtml(t.state) + '</span>'
+      + '</div>';
+
+    html += '<div class="job-meta-grid">'
+      + metaItem(I18n.t('missions.threadId'), t.id)
+      + metaItem(I18n.t('missions.type'), t.thread_type)
+      + metaItem(I18n.t('missions.steps'), t.step_count)
+      + metaItem(I18n.t('missions.tokens'), t.total_tokens.toLocaleString())
+      + metaItem(I18n.t('missions.cost'), t.total_cost_usd > 0 ? '$' + t.total_cost_usd.toFixed(4) : '-')
+      + metaItem(I18n.t('missions.maxIterations'), t.max_iterations)
+      + metaItem(I18n.t('missions.created'), formatDate(t.created_at))
+      + metaItem(I18n.t('jobs.completedLabel'), t.completed_at ? formatDate(t.completed_at) : '-')
+      + '</div>';
+
+    if (t.messages && t.messages.length > 0) {
+      html += '<div class="job-description"><h3>Messages (' + t.messages.length + ')</h3>';
+      t.messages.forEach(function(msg, i) {
+        var roleClass = msg.role === 'Assistant' ? 'assistant' : msg.role === 'User' ? 'user' : 'system';
+        html += '<div class="thread-message thread-msg-' + roleClass + '">'
+          + '<div class="thread-msg-role">' + escapeHtml(msg.role) + '</div>'
+          + '<div class="thread-msg-content">' + renderMarkdown(msg.content) + '</div>'
+          + '</div>';
+      });
+      html += '</div>';
+    }
+
+    detail.innerHTML = html;
+  }).catch(function(err) {
+    showToast(I18n.t('missions.threadLoadFailed', { message: err.message }), 'error');
+  });
+}
+
+function fireMission(id) {
+  apiFetch('/api/engine/missions/' + id + '/fire', { method: 'POST' })
+    .then((data) => {
+      if (data.fired) {
+        showToast(I18n.t('missions.fired', { id: data.thread_id }), 'success');
+      } else {
+        showToast(I18n.t('missions.notFired'), 'warning');
+      }
+      if (currentMissionId === id) openMissionDetail(id);
+      else loadMissions();
+    })
+    .catch((err) => showToast(I18n.t('missions.fireFailed', { message: err.message }), 'error'));
+}
+
+function pauseMission(id) {
+  apiFetch('/api/engine/missions/' + id + '/pause', { method: 'POST' })
+    .then(() => {
+      showToast(I18n.t('missions.paused'), 'success');
+      if (currentMissionId === id) openMissionDetail(id);
+      else loadMissions();
+    })
+    .catch((err) => showToast(I18n.t('missions.pauseFailed', { message: err.message }), 'error'));
+}
+
+function resumeMission(id) {
+  apiFetch('/api/engine/missions/' + id + '/resume', { method: 'POST' })
+    .then(() => {
+      showToast(I18n.t('missions.resumed'), 'success');
+      if (currentMissionId === id) openMissionDetail(id);
+      else loadMissions();
+    })
+    .catch((err) => showToast(I18n.t('missions.resumeFailed', { message: err.message }), 'error'));
 }
 
 function formatRelativeTime(isoString) {
@@ -4653,13 +5960,8 @@ function fetchGatewayStatus() {
   }).catch(function() {});
 }
 
-// Show/hide popover on hover
-document.getElementById('gateway-status-trigger').addEventListener('mouseenter', () => {
-  document.getElementById('gateway-popover').classList.add('visible');
-});
-document.getElementById('gateway-status-trigger').addEventListener('mouseleave', () => {
-  document.getElementById('gateway-popover').classList.remove('visible');
-});
+// Gateway popover is now inline in the user dropdown — no hover toggle needed.
+// The popover content is updated by startGatewayStatusPolling() into #gateway-popover.
 
 // --- TEE attestation ---
 
@@ -4728,10 +6030,11 @@ function fetchTeeReport() {
 
 function renderTeePopover(report) {
   var popover = document.getElementById('tee-popover');
-  var digest = (teeInfo && teeInfo.image_digest) || 'N/A';
-  var fingerprint = report.tls_certificate_fingerprint || 'N/A';
+  var na = I18n.t('common.noData');
+  var digest = (teeInfo && teeInfo.image_digest) || na;
+  var fingerprint = report.tls_certificate_fingerprint || na;
   var reportData = report.report_data || '';
-  var vmConfig = report.vm_config || 'N/A';
+  var vmConfig = report.vm_config || na;
   var truncated = reportData.length > 32 ? reportData.slice(0, 32) + '...' : reportData;
   popover.innerHTML = '<div class="tee-popover-title">'
     + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>'
@@ -4752,9 +6055,9 @@ function copyTeeReport() {
   if (!teeReportCache) return;
   var combined = Object.assign({}, teeReportCache, teeInfo || {});
   navigator.clipboard.writeText(JSON.stringify(combined, null, 2)).then(function() {
-    showToast('Attestation report copied', 'success');
+    showToast(I18n.t('tee.reportCopied'), 'success');
   }).catch(function() {
-    showToast('Failed to copy report', 'error');
+    showToast(I18n.t('tee.copyFailed'), 'error');
   });
 }
 
@@ -4771,12 +6074,12 @@ document.getElementById('tee-shield').addEventListener('mouseleave', function() 
 function installWasmExtension() {
   var name = document.getElementById('wasm-install-name').value.trim();
   if (!name) {
-    showToast('Extension name is required', 'error');
+    showToast(I18n.t('extensions.nameRequired'), 'error');
     return;
   }
   var url = document.getElementById('wasm-install-url').value.trim();
   if (!url) {
-    showToast('URL to .tar.gz bundle is required', 'error');
+    showToast(I18n.t('extensions.urlRequired'), 'error');
     return;
   }
 
@@ -4785,27 +6088,27 @@ function installWasmExtension() {
     body: { name: name, url: url, kind: 'wasm_tool' },
   }).then(function(res) {
     if (res.success) {
-      showToast('Installed ' + name, 'success');
+      showToast(I18n.t('extensions.installedName', { name: name }), 'success');
       document.getElementById('wasm-install-name').value = '';
       document.getElementById('wasm-install-url').value = '';
       loadExtensions();
     } else {
-      showToast('Install failed: ' + (res.message || 'unknown error'), 'error');
+      showToast(I18n.t('extensions.installFailed', { message: res.message || 'unknown error' }), 'error');
     }
   }).catch(function(err) {
-    showToast('Install failed: ' + err.message, 'error');
+    showToast(I18n.t('extensions.installFailed', { message: err.message }), 'error');
   });
 }
 
 function addMcpServer() {
   var name = document.getElementById('mcp-install-name').value.trim();
   if (!name) {
-    showToast('Server name is required', 'error');
+    showToast(I18n.t('mcp.serverNameRequired'), 'error');
     return;
   }
   var url = document.getElementById('mcp-install-url').value.trim();
   if (!url) {
-    showToast('MCP server URL is required', 'error');
+    showToast(I18n.t('mcp.urlRequired'), 'error');
     return;
   }
 
@@ -4814,15 +6117,15 @@ function addMcpServer() {
     body: { name: name, url: url, kind: 'mcp_server' },
   }).then(function(res) {
     if (res.success) {
-      showToast('Added MCP server ' + name, 'success');
+      showToast(I18n.t('mcp.added', { name: name }), 'success');
       document.getElementById('mcp-install-name').value = '';
       document.getElementById('mcp-install-url').value = '';
       loadMcpServers();
     } else {
-      showToast('Failed to add MCP server: ' + (res.message || 'unknown error'), 'error');
+      showToast(I18n.t('mcp.addFailed', { message: res.message || 'unknown error' }), 'error');
     }
   }).catch(function(err) {
-    showToast('Failed to add MCP server: ' + err.message, 'error');
+    showToast(I18n.t('mcp.addFailed', { message: err.message }), 'error');
   });
 }
 
@@ -4971,10 +6274,10 @@ function renderCatalogSkillCard(entry, installedNames) {
   name.textContent = entry.name || entry.slug;
   name.href = 'https://clawhub.ai/skills/' + encodeURIComponent(entry.slug);
   name.target = '_blank';
-  name.rel = 'noopener';
+  name.rel = 'noopener noreferrer';
   name.style.textDecoration = 'none';
   name.style.color = 'inherit';
-  name.title = 'View on ClawHub';
+  name.title = I18n.t('skills.viewOnClawHub');
   header.appendChild(name);
 
   if (entry.version) {
@@ -5044,7 +6347,8 @@ function renderCatalogSkillCard(entry, installedNames) {
   actions.className = 'ext-actions';
 
   var slug = entry.slug || entry.name;
-  var isInstalled = installedNames[entry.name] || installedNames[slug];
+  var slugSuffix = slug.indexOf('/') >= 0 ? slug.split('/').pop() : slug;
+  var isInstalled = entry.installed || installedNames[entry.name] || installedNames[slug] || installedNames[slugSuffix];
 
   if (isInstalled) {
     var label = document.createElement('span');
@@ -5055,14 +6359,14 @@ function renderCatalogSkillCard(entry, installedNames) {
     var installBtn = document.createElement('button');
     installBtn.className = 'btn-ext install';
     installBtn.textContent = I18n.t('extensions.install');
-    installBtn.addEventListener('click', (function(s, btn) {
+    installBtn.addEventListener('click', (function(displayName, slugValue, btn) {
       return function() {
-        if (!confirm('Install skill "' + s + '" from ClawHub?')) return;
+        if (!confirm(I18n.t('skills.confirmInstallHub', { name: displayName }))) return;
         btn.disabled = true;
         btn.textContent = I18n.t('extensions.installing');
-        installSkill(s, null, btn);
+        installSkill(displayName, null, btn, slugValue);
       };
-    })(slug, installBtn));
+    })(entry.name || slug, slug, installBtn));
     actions.appendChild(installBtn);
   }
 
@@ -5091,8 +6395,9 @@ function formatTimeAgo(epochMs) {
   return Math.floor(months / 12) + 'y ago';
 }
 
-function installSkill(nameOrSlug, url, btn) {
-  var body = { name: nameOrSlug, slug: nameOrSlug };
+function installSkill(name, url, btn, slug) {
+  var body = { name: name };
+  if (slug) body.slug = slug;
   if (url) body.url = url;
 
   apiFetch('/api/skills/install', {
@@ -5101,15 +6406,22 @@ function installSkill(nameOrSlug, url, btn) {
     body: body,
   }).then(function(res) {
     if (res.success) {
-      showToast(I18n.t('skills.installedSuccess', {name: nameOrSlug}), 'success');
+      showToast(I18n.t('skills.installedSuccess', {name: name}), 'success');
+      if (btn && btn.parentNode) {
+        var label = document.createElement('span');
+        label.className = 'ext-active-label';
+        label.textContent = I18n.t('status.installed');
+        btn.parentNode.innerHTML = '';
+        btn.parentNode.appendChild(label);
+      }
     } else {
-      showToast('Install failed: ' + (res.message || 'unknown error'), 'error');
+      showToast(I18n.t('extensions.installFailed', { message: res.message || 'unknown error' }), 'error');
     }
     loadSkills();
-    if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
+    if (btn && !res.success) { btn.disabled = false; btn.textContent = I18n.t('extensions.install'); }
   }).catch(function(err) {
-    showToast('Install failed: ' + err.message, 'error');
-    if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
+    showToast(I18n.t('extensions.installFailed', { message: err.message }), 'error');
+    if (btn) { btn.disabled = false; btn.textContent = I18n.t('extensions.install'); }
   });
 }
 
@@ -5133,13 +6445,13 @@ function removeSkill(name) {
 
 function installSkillFromForm() {
   var name = document.getElementById('skill-install-name').value.trim();
-  if (!name) { showToast('Skill name is required', 'error'); return; }
+  if (!name) { showToast(I18n.t('skills.nameRequired'), 'error'); return; }
   var url = document.getElementById('skill-install-url').value.trim() || null;
   if (url && !url.startsWith('https://')) {
-    showToast('URL must use HTTPS', 'error');
+    showToast(I18n.t('skills.httpsRequired'), 'error');
     return;
   }
-  if (!confirm('Install skill "' + name + '"?')) return;
+  if (!confirm(I18n.t('skills.confirmInstall', { name: name }))) return;
   installSkill(name, url, null);
   document.getElementById('skill-install-name').value = '';
   document.getElementById('skill-install-url').value = '';
@@ -5149,6 +6461,110 @@ function installSkillFromForm() {
 document.getElementById('skill-search-input').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') searchClawHub();
 });
+
+// --- Tool Permissions ---
+
+function loadToolsPermissions() {
+  var container = document.getElementById('tools-permissions-list');
+  if (!container) return;
+  container.innerHTML = '<div class="empty-state">' + I18n.t('common.loading') + '</div>';
+  apiFetch('/api/settings/tools').then(function(data) {
+    if (!data.tools || data.tools.length === 0) {
+      container.innerHTML = '<div class="empty-state">' + I18n.t('tools.noTools') + '</div>';
+      return;
+    }
+    container.innerHTML = '';
+    for (var i = 0; i < data.tools.length; i++) {
+      container.appendChild(renderToolPermissionRow(data.tools[i]));
+    }
+  }).catch(function(err) {
+    container.innerHTML = '<div class="empty-state">' + I18n.t('common.loadFailed') + ': ' + escapeHtml(err.message) + '</div>';
+  });
+}
+
+function renderToolPermissionRow(tool) {
+  var row = document.createElement('div');
+  row.className = 'tool-permission-row';
+  row.dataset.toolName = tool.name;
+
+  // Left: name + description
+  var info = document.createElement('div');
+  info.className = 'tool-permission-info';
+
+  var name = document.createElement('span');
+  name.className = 'tool-permission-name';
+  name.textContent = tool.name;
+
+  var desc = document.createElement('span');
+  desc.className = 'tool-permission-desc';
+  desc.textContent = tool.description;
+
+  info.appendChild(name);
+  info.appendChild(desc);
+
+  // Right: lock icon or toggle + default badge
+  var controls = document.createElement('div');
+  controls.className = 'tool-permission-controls';
+
+  if (tool.locked) {
+    var lock = document.createElement('span');
+    lock.className = 'tool-lock-icon';
+    lock.title = I18n.t('tools.lockedTooltip');
+    lock.textContent = '\uD83D\uDD12';
+    controls.appendChild(lock);
+  } else {
+    var toggle = document.createElement('div');
+    toggle.className = 'tool-permission-toggle';
+
+    var states = [
+      { value: 'always_allow', label: I18n.t('tools.alwaysAllow') },
+      { value: 'ask_each_time', label: I18n.t('tools.askEachTime') },
+      { value: 'disabled', label: I18n.t('tools.disabled') },
+    ];
+
+    for (var j = 0; j < states.length; j++) {
+      (function(state) {
+        var btn = document.createElement('button');
+        btn.textContent = state.label;
+        btn.dataset.state = state.value;
+        btn.setAttribute('aria-pressed', tool.current_state === state.value);
+        if (tool.current_state === state.value) btn.classList.add('active');
+        btn.addEventListener('click', function() {
+          setToolPermission(tool.name, state.value, row);
+        });
+        toggle.appendChild(btn);
+      })(states[j]);
+    }
+
+    controls.appendChild(toggle);
+  }
+
+  if (tool.current_state === tool.default_state) {
+    var badge = document.createElement('span');
+    badge.className = 'tool-default-badge';
+    badge.textContent = I18n.t('tools.defaultBadge');
+    controls.appendChild(badge);
+  }
+
+  row.appendChild(info);
+  row.appendChild(controls);
+  return row;
+}
+
+function setToolPermission(toolName, newState, rowEl) {
+  apiFetch('/api/settings/tools/' + encodeURIComponent(toolName), {
+    method: 'PUT',
+    body: { state: newState },
+  }).then(function(updated) {
+    // Re-render just this row in-place.
+    var newRow = renderToolPermissionRow(updated);
+    if (rowEl && rowEl.parentNode) {
+      rowEl.parentNode.replaceChild(newRow, rowEl);
+    }
+  }).catch(function(err) {
+    showToast(I18n.t('tools.saveFailed', { message: err.message }), 'error');
+  });
+}
 
 // --- Keyboard shortcuts ---
 
@@ -5256,6 +6672,7 @@ function loadSettingsSubtab(subtab) {
   else if (subtab === 'mcp') loadMcpServers();
   else if (subtab === 'skills') loadSkills();
   else if (subtab === 'users') loadUsers();
+  else if (subtab === 'tools') loadToolsPermissions();
   if (subtab !== 'extensions' && subtab !== 'channels') stopPairingPoll();
 }
 
@@ -5706,7 +7123,7 @@ function saveSetting(key, value) {
       showRestartBanner();
     }
   }).catch(function(err) {
-    showToast('Failed to save ' + key + ': ' + err.message, 'error');
+    showToast(I18n.t('settings.saveFailed', { key: key, message: err.message }), 'error');
   });
 }
 
@@ -6176,6 +7593,30 @@ function formatDate(isoString) {
 // --- Event Listener Registration (CSP-safe, no inline handlers) ---
 
 document.getElementById('auth-connect-btn').addEventListener('click', () => authenticate());
+
+// User avatar dropdown toggle.
+document.getElementById('user-avatar-btn').addEventListener('click', function(e) {
+  e.stopPropagation();
+  var dd = document.getElementById('user-dropdown');
+  if (dd) dd.style.display = dd.style.display === 'none' ? '' : 'none';
+});
+// Close dropdown on click outside.
+document.addEventListener('click', function(e) {
+  var dd = document.getElementById('user-dropdown');
+  var account = document.getElementById('user-account');
+  if (dd && account && !account.contains(e.target)) {
+    dd.style.display = 'none';
+  }
+});
+// Logout handler.
+document.getElementById('user-logout-btn').addEventListener('click', function() {
+  fetch('/auth/logout', { method: 'POST', credentials: 'include' })
+    .finally(function() {
+      sessionStorage.removeItem('ironclaw_token');
+      sessionStorage.removeItem('ironclaw_oidc');
+      window.location.reload();
+    });
+});
 document.getElementById('restart-overlay').addEventListener('click', () => cancelRestart());
 document.getElementById('restart-close-btn').addEventListener('click', () => cancelRestart());
 document.getElementById('restart-cancel-btn').addEventListener('click', () => cancelRestart());
@@ -6258,6 +7699,31 @@ document.addEventListener('click', function(e) {
       break;
     case 'close-routine-detail':
       closeRoutineDetail();
+      break;
+    case 'open-mission':
+      openMissionDetail(el.dataset.id);
+      break;
+    case 'close-mission-detail':
+      closeMissionDetail();
+      break;
+    case 'fire-mission':
+      e.stopPropagation();
+      fireMission(el.dataset.id);
+      break;
+    case 'pause-mission':
+      e.stopPropagation();
+      pauseMission(el.dataset.id);
+      break;
+    case 'resume-mission':
+      e.stopPropagation();
+      resumeMission(el.dataset.id);
+      break;
+    case 'open-engine-thread':
+      openEngineThread(el.dataset.id);
+      break;
+    case 'back-to-mission':
+      if (currentMissionId) openMissionDetail(currentMissionId);
+      else closeMissionDetail();
       break;
     case 'view-run-job':
       e.preventDefault();
